@@ -45,6 +45,11 @@ const SDL_DialogFileFilter kDiscFilters[] = {
 // Android's content:// are kept as they are.
 std::string absolute_disc_path(const std::string& path) {
     if (path.empty() || path.find("://") != std::string::npos) return path;
+#if defined(SDL_PLATFORM_VITA)
+    // The Vita's paths name their device ("ux0:data/gt3r/GT3.iso") and are absolute already;
+    // std::filesystem takes them for relative ones and would put the working directory in front.
+    return path;
+#endif
     std::error_code ec;
     std::filesystem::path p(std::u8string(path.begin(), path.end())); // UTF-8 on every platform
     if (p.is_absolute()) return path;
@@ -53,6 +58,26 @@ std::string absolute_disc_path(const std::string& path) {
     const std::u8string out = abs.lexically_normal().u8string();
     return std::string(out.begin(), out.end());
 }
+
+#if defined(SDL_PLATFORM_VITA)
+// The disc images (.iso, .chd) directly in `dir`, by name. The Vita has no file dialog (SDL's is
+// the dummy one there), so the player copies the image into the user data folder
+// (docs/dev/VITA.md).
+std::vector<std::string> disc_images_in(const std::string& dir) {
+    std::vector<std::string> out;
+    int count = 0;
+    if (char** names = SDL_GlobDirectory(dir.c_str(), "*", SDL_GLOB_CASEINSENSITIVE, &count)) {
+        for (int i = 0; i < count; ++i) {
+            const std::string name = names[i];
+            const std::string ext = name.size() > 4 ? to_lower(name.substr(name.size() - 4)) : "";
+            if (ext == ".iso" || ext == ".chd") out.push_back(dir + name);
+        }
+        SDL_free(names);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+#endif
 
 void SDLCALL on_dialog(void* user, const char* const* files, int) {
     auto* app = static_cast<App*>(user);
@@ -131,10 +156,10 @@ bool App::init(int argc, char** argv) {
     // [video] fullscreen = on at start), leaving no way out but F11.
     SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY, "1");
     SDL_WindowFlags win_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
-    win_flags |= SDL_WINDOW_FULLSCREEN; // immersive: hide system bars
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_VITA)
+    win_flags |= SDL_WINDOW_FULLSCREEN; // immersive: hide system bars (the Vita: the whole screen)
 #endif
-#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
+#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_VITA)
     // [video] fullscreen = on | off (desktop; F11 and the Settings screen change it)
     if (to_lower(config_.get("video", "fullscreen").value_or("off")) == "on") win_flags |= SDL_WINDOW_FULLSCREEN;
 #endif
@@ -145,7 +170,11 @@ bool App::init(int argc, char** argv) {
         win_flags &= ~SDL_WINDOW_FULLSCREEN;
     }
     touch_ui_ = platform::is_mobile() || phone_sim_;
+#if defined(SDL_PLATFORM_VITA)
+    window_ = SDL_CreateWindow("GT3 Revisited", 960, 544, win_flags); // the Vita's screen
+#else
     window_ = SDL_CreateWindow("GT3 Revisited", phone_sim_ ? 1170 : 1280, phone_sim_ ? 540 : 720, win_flags);
+#endif
     if (!window_) {
         LOG_ERROR("Window creation failed: %s", SDL_GetError());
         return false;
@@ -183,6 +212,11 @@ bool App::init(int argc, char** argv) {
         else if (a == "--render-scale" && i + 1 < argc)
             render_scale = platform::parse_render_scale(argv[++i]), render_scale_arg_ = true;
     }
+#if defined(SDL_PLATFORM_VITA)
+    // No 3D device for the Vita yet (SDL_GPU has no backend there; docs/dev/VITA.md): the menus
+    // on SDL's own 2D renderer (vitagxm).
+    use_gpu = false;
+#endif
     int win_pw = 0, win_ph = 0;
     SDL_GetWindowSizeInPixels(window_, &win_pw, &win_ph);
     gpu_opts.render_scale = render_scale ? *render_scale
@@ -276,6 +310,19 @@ bool App::init(int argc, char** argv) {
     }
     if (!disc_path.empty()) last_error_ = open_disc(disc_path);
     else open_saved_disc(config_.get("game", "disc").value_or(""));
+#if defined(SDL_PLATFORM_VITA)
+    // No file dialog: the first image in the user data folder, when no remembered one opened.
+    if (!disc_)
+        for (const std::string& image : disc_images_in(data_dir_)) {
+            const std::string error = open_disc(image);
+            if (disc_) {
+                last_error_.clear();
+                failed_disc_path_.clear();
+                break;
+            }
+            if (last_error_.empty()) last_error_ = error;
+        }
+#endif
     push(disc_ ? make_hub_screen() : make_setup_screen());
     // Normal start is the game itself (opening movie, then the title menu);
     // the home menu sits underneath (backing out of the title menu shows it).
@@ -292,7 +339,12 @@ bool App::init(int argc, char** argv) {
     // The update check (README "Online"; [online] update_check): in the background, never waited for.
     // --shot runs use only the cached answer (no traffic to a live server) unless GT3R_UPDATE_CHECK=1.
     const char* uc = SDL_getenv("GT3R_UPDATE_CHECK");
+#if defined(SDL_PLATFORM_VITA)
+    (void)uc;
+    updates().startup(*this, false); // upstream has no Vita package to update to (docs/dev/VITA.md)
+#else
     updates().startup(*this, auto_shot_path_.empty() || (uc && *uc == '1'));
+#endif
     reset_dynamic_scale();
     last_ticks_ = SDL_GetTicksNS();
     return true;
@@ -705,6 +757,13 @@ void App::close_disc() {
 }
 
 void App::show_open_dialog() {
+#if defined(SDL_PLATFORM_VITA)
+    // No file dialog on the Vita: the image the player copied into the user data folder.
+    const std::vector<std::string> found = disc_images_in(data_dir_);
+    if (!found.empty()) set_dialog_result(found.front());
+    else last_error_ = "No disc image in " + data_dir_ + ". Copy your .iso there (VitaShell or FTP) and try again.";
+    return;
+#endif
     // iOS: SDL has no file dialog there; the system's document picker opens the image in place.
     if (platform::show_document_picker(window_, kDiscFilters, SDL_arraysize(kDiscFilters), [this](std::string path) {
             if (!path.empty()) set_dialog_result(std::move(path));

@@ -14,6 +14,15 @@ option(GT3R_BUILD_TOOLS "Build the gt3tool command line utility" ON)
 option(GT3R_BUILD_TESTS "Build unit tests" ON)
 option(GT3R_PROGRAM_TOOLS "Developer-only gt3tool commands" OFF)
 
+# PlayStation Vita (configured with VitaSDK's toolchain file, docs/dev/VITA.md): the game only,
+# packaged as a .vpk; the unit tests and command line tools are desktop programs.
+if(VITASDK)
+  set(GT3R_VITA ON)
+  include("${VITASDK}/share/vita.cmake" REQUIRED)
+  set(GT3R_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(GT3R_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+endif()
+
 if(IOS)
   # The warnings are the flags below, as on every platform, not Xcode's iOS defaults on top
   # (-Wshorten-64-to-32).
@@ -57,6 +66,14 @@ if(GT3R_XR)
   target_compile_definitions(gt3r_engine PUBLIC GT3R_XR=1)
   target_include_directories(gt3r_engine SYSTEM PUBLIC ${GT3R_OPENXR_INCLUDE_DIR})
 endif()
+if(GT3R_VITA)
+  # _GNU_SOURCE: VitaSDK's newlib hides POSIX 2008 (strnlen, O_CLOEXEC) under a strict -std=c++20.
+  target_compile_definitions(gt3r_engine PUBLIC GT3R_VITA=1 _GNU_SOURCE)
+  # std::thread (VitaSDK's pthread-embedded), the whole archive: libstdc++ decides whether threads
+  # work from a weak reference to a pthread function that nothing else pulls in, and without it
+  # every std::thread throws "Enable multithreading to use std::thread".
+  target_link_libraries(gt3r_engine PUBLIC -Wl,--whole-archive pthread -Wl,--no-whole-archive)
+endif()
 # Online play (src/net): Winsock on Windows.
 if(WIN32)
   target_link_libraries(gt3r_engine PUBLIC ws2_32)
@@ -64,7 +81,9 @@ endif()
 # The OpenGL ES 3.0 renderer (src/render/gpu_gles.*, docs/dev/RENDERING.md "OpenGL ES"): the
 # fallback for PCs whose GPU SDL_GPU has no backend for (no Vulkan). It compiles to nothing
 # without GT3R_GLES.
-if(WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID))
+if(GT3R_VITA)
+  set(_gt3r_gles_default OFF) # the Vita's GPU has no OpenGL ES 3.0 (docs/dev/VITA.md)
+elseif(WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID))
   set(_gt3r_gles_default ON)
 else()
   set(_gt3r_gles_default OFF)
@@ -204,7 +223,7 @@ endif()
 # Optional developer tools that are not part of every checkout: any
 # tools/<name>/devtool.cmake is included (none of them is needed to build or
 # test the game).
-if(NOT ANDROID AND NOT IOS)
+if(NOT ANDROID AND NOT IOS AND NOT GT3R_VITA)
   file(GLOB GT3R_DEVTOOL_SCRIPTS ${CMAKE_SOURCE_DIR}/tools/*/devtool.cmake)
   foreach(_devtool ${GT3R_DEVTOOL_SCRIPTS})
     include(${_devtool})
@@ -237,6 +256,27 @@ if(GT3R_FUZZ AND NOT ANDROID AND NOT IOS)
     target_compile_options(gt3r_fuzz PRIVATE -fsanitize=fuzzer)
     target_link_options(gt3r_fuzz PRIVATE -fsanitize=fuzzer)
   endif()
+endif()
+
+# PlayStation Vita: eboot.bin and the installable gt3r.vpk with its LiveArea pictures
+# (packaging/vita/sce_sys). The title ID is the homebrew's own: 9 characters, unique on the console.
+if(GT3R_VITA)
+  set(VITA_APP_NAME "GT3 Revisited")
+  set(VITA_TITLEID "GT3R00001")
+  set(VITA_VERSION "00.80") # project version 0.8.x, in the param.sfo's XX.YY form
+  set(_vita_sys ${CMAKE_SOURCE_DIR}/packaging/vita/sce_sys)
+  # ATTRIBUTE2=12: extended memory mode, about 365 MB for the game instead of about 256 MB. The
+  # 256 MB heap (src/app/vita_process.cpp) cannot be had without it: newlib gets no heap at all,
+  # and the first allocation of the static initializers aborts.
+  set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+  vita_create_self(eboot.bin gt3r UNSAFE)
+  vita_create_vpk(gt3r.vpk ${VITA_TITLEID} eboot.bin
+    VERSION ${VITA_VERSION}
+    NAME ${VITA_APP_NAME}
+    FILE ${_vita_sys}/icon0.png sce_sys/icon0.png
+         ${_vita_sys}/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+         ${_vita_sys}/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+         ${_vita_sys}/livearea/contents/template.xml sce_sys/livearea/contents/template.xml)
 endif()
 
 # Icons, Info.plist and install rules for release packages.

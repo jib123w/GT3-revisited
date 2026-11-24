@@ -127,8 +127,13 @@ public:
             y += 11;
         }
         y += 4;
-        for (const std::string& line :
-             Ui::wrap("To play, open a disc image (.iso or .chd) made from your own copy of Gran Turismo 3 A-Spec.", lw)) {
+#if defined(SDL_PLATFORM_VITA)
+        const char* how = "To play, copy a disc image (.iso or .chd) made from your own copy of Gran Turismo 3 A-Spec "
+                          "to ux0:data/gt3r/ on this Vita.";
+#else
+        const char* how = "To play, open a disc image (.iso or .chd) made from your own copy of Gran Turismo 3 A-Spec.";
+#endif
+        for (const std::string& line : Ui::wrap(how, lw)) {
             ui.text(lx, y, line, colors::kDim);
             y += 11;
         }
@@ -140,7 +145,7 @@ public:
             if (it.kind == Item::Settings) rects_[i] = {lx, y + bh + 8, kCanQuit ? std::floor((lw - 8) / 2) : lw, sh};
             if (it.kind == Item::Quit) rects_[i] = {lx + std::floor((lw - 8) / 2) + 8, y + bh + 8, std::floor((lw - 8) / 2), sh};
         }
-#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
+#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_VITA)
         if (!touch) ui.text(lx, y + bh + 8 + sh + 10, "or drop the .iso or .chd onto this window", colors::kDim);
 #endif
 
@@ -245,7 +250,11 @@ private:
             if (int(items_.size()) < 4 && there_[i] && !platform::same_disc_path(library_[i], app.failed_disc_path()))
                 items_.push_back({Item::Recent, "", library_[i]});
         recent_count_ = int(items_.size());
+#if defined(SDL_PLATFORM_VITA)
+        items_.push_back({Item::Browse, "Look in ux0:data/gt3r/", ""}); // no file dialog (App::show_open_dialog)
+#else
         items_.push_back({Item::Browse, "Open disc image", ""});
+#endif
         items_.push_back({Item::Settings, "Settings", ""});
         if (kCanQuit) items_.push_back({Item::Quit, "Quit", ""});
     }

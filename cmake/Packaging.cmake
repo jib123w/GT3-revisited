@@ -51,7 +51,7 @@ elseif(TARGET gt3r AND WIN32)
   target_sources(gt3r PRIVATE ${GT3R_PACKAGING_DIR}/gt3r.rc)
 endif()
 
-if(ANDROID OR IOS) # (packaged by Gradle, or installed from Xcode by each builder)
+if(ANDROID OR IOS OR GT3R_VITA) # (packaged by Gradle, installed from Xcode, or a .vpk: CMakeLists.txt)
   return()
 endif()
 

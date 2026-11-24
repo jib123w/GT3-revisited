@@ -663,6 +663,11 @@ std::string user_data_dir() {
     // with Android's documents provider. SDL_GetPrefPath's Library folder is hidden from both.
     if (const char* docs = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS)) return docs;
 #endif
+#if defined(SDL_PLATFORM_VITA)
+    // The Vita: one short folder the player reaches with VitaShell or FTP, for the disc image in
+    // and saves out (SDL_GetPrefPath's would be ux0:/data/GT3Revisited/GT3Revisited/).
+    return "ux0:data/gt3r/";
+#endif
     const char* base = SDL_GetBasePath();
     if (base && host_path_exists(std::string(base) + "portable.ini")) {
         dir = base;

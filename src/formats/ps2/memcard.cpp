@@ -1,6 +1,7 @@
 #include "formats/ps2/memcard.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 
@@ -45,6 +46,13 @@ s64 get_time(ByteSpan b, size_t o) {
     if (tm.tm_year < 70 || tm.tm_mon < 0 || tm.tm_mday < 1) return 0;
 #ifdef _WIN32
     s64 t = s64(_mkgmtime(&tm));
+#elif defined(__vita__)
+    // VitaSDK's newlib has no timegm: the same count from C++20's calendar, which carries a day
+    // past the month's end into the next month as timegm does.
+    const auto date = std::chrono::year{tm.tm_year + 1900} / std::chrono::month(unsigned(tm.tm_mon + 1)) /
+                      std::chrono::day(unsigned(tm.tm_mday));
+    s64 t = s64(std::chrono::sys_days(date).time_since_epoch().count()) * 86400 + tm.tm_hour * 3600 +
+            tm.tm_min * 60 + tm.tm_sec;
 #else
     s64 t = s64(timegm(&tm));
 #endif

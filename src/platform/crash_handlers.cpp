@@ -115,6 +115,14 @@ LONG WINAPI on_exception(EXCEPTION_POINTERS* info) {
 
 void on_abort(int) { log_file::crash_note("Closed by abort()"); }
 
+#elif defined(SDL_PLATFORM_VITA)
+
+// --- PlayStation Vita ----------------------------------------------------------------
+// newlib has no sigaction or siginfo, and a crash is the system's own (an error code, and a core
+// dump in ux0:data). abort() still raises SIGABRT, which signal() catches.
+
+void on_abort(int) { log_file::crash_note("Closed by abort()"); }
+
 #else
 
 // --- POSIX signals -------------------------------------------------------------------
@@ -214,6 +222,8 @@ void install_crash_handlers() {
     g_old_terminate = std::set_terminate(on_terminate);
 #ifdef SDL_PLATFORM_WINDOWS
     g_old_filter = SetUnhandledExceptionFilter(on_exception);
+    std::signal(SIGABRT, on_abort);
+#elif defined(SDL_PLATFORM_VITA)
     std::signal(SIGABRT, on_abort);
 #else
     stack_t ss{};

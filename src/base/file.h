@@ -34,6 +34,11 @@ private:
     std::string path_;
     u64 size_;
     std::mutex mutex_;
+#if defined(__vita__)
+    // The Vita reads through sceIo instead (file.cpp): SDL's streams seek with newlib's fseeko
+    // there, whose offset is a 32-bit long, so nothing past 2 GB of a disc image could be read.
+    int vita_fd_ = -1;
+#endif
 };
 
 // Whole-file helpers for small host files (configs, mod files).

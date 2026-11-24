@@ -7,6 +7,10 @@
 
 #include <algorithm>
 
+#if defined(__vita__)
+#include <psp2/io/fcntl.h>
+#endif
+
 namespace gt3r {
 
 namespace {
@@ -22,6 +26,19 @@ bool in_tree(const std::string&) { return false; }
 } // namespace
 
 std::unique_ptr<File> File::open(const std::string& path) {
+#if defined(__vita__)
+    // 64-bit offsets (sceIoLseek, sceIoPread) for disc images over 2 GB; see vita_fd_.
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (fd < 0) return nullptr;
+    const SceOff sz = sceIoLseek(fd, 0, SCE_SEEK_END);
+    if (sz < 0) {
+        sceIoClose(fd);
+        return nullptr;
+    }
+    std::unique_ptr<File> f(new File(nullptr, path, static_cast<u64>(sz)));
+    f->vita_fd_ = fd;
+    return f;
+#else
     SDL_IOStream* io = nullptr;
 #if defined(SDL_PLATFORM_ANDROID)
     if (in_tree(path)) {
@@ -38,6 +55,7 @@ std::unique_ptr<File> File::open(const std::string& path) {
         return nullptr;
     }
     return std::unique_ptr<File>(new File(io, path, static_cast<u64>(sz)));
+#endif
 }
 
 File::File(SDL_IOStream* io, std::string path, u64 size)
@@ -45,10 +63,24 @@ File::File(SDL_IOStream* io, std::string path, u64 size)
 
 File::~File() {
     if (io_) SDL_CloseIO(io_);
+#if defined(__vita__)
+    if (vita_fd_ >= 0) sceIoClose(vita_fd_);
+#endif
 }
 
 void File::read_at(u64 offset, void* out, size_t len) {
     if (offset > size_ || size_ - offset < len) throw FormatError("read past end of " + path_);
+#if defined(__vita__)
+    // A positioned read: no seek to share, so the threads need no lock.
+    size_t done = 0;
+    auto* dst = static_cast<u8*>(out);
+    while (done < len) {
+        const SceSSize n = sceIoPread(vita_fd_, dst + done, SceSize(len - done), SceOff(offset + done));
+        if (n <= 0) throw FormatError("short read in " + path_);
+        done += size_t(n);
+    }
+    return;
+#endif
     std::lock_guard lock(mutex_);
     if (SDL_SeekIO(io_, static_cast<Sint64>(offset), SDL_IO_SEEK_SET) < 0)
         throw FormatError("seek failed in " + path_);

@@ -13,7 +13,9 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#if !defined(__vita__)
 #include <ifaddrs.h>
+#endif
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/select.h>
@@ -151,7 +153,7 @@ bool UdpSocket::setup(int family, u16 port, std::string* error) {
     if (family == AF_INET6) {
         auto* s = reinterpret_cast<sockaddr_in6*>(&local);
         s->sin6_family = AF_INET6;
-        s->sin6_addr = in6addr_any;
+        s->sin6_addr = in6_addr{}; // in6addr_any (all zeros), which the Vita's headers don't declare
         s->sin6_port = htons(port);
         len = sizeof(sockaddr_in6);
     } else {
@@ -287,7 +289,10 @@ bool UdpSocket::wait_readable(int timeout_ms) const {
 
 std::vector<std::string> local_addresses() {
     std::vector<std::string> out;
-#if !defined(_WIN32)
+#if defined(__vita__)
+    // No getifaddrs on the Vita (its address comes from SceNetCtl): none listed until online play
+    // is ported (docs/dev/VITA.md).
+#elif !defined(_WIN32)
     ifaddrs* list = nullptr;
     if (getifaddrs(&list) != 0) return out;
     for (ifaddrs* i = list; i; i = i->ifa_next) {

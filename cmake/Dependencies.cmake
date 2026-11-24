@@ -20,6 +20,16 @@ if(CMAKE_VERSION VERSION_LESS 3.28)
 else()
   FetchContent_MakeAvailable(libchdr)
 endif()
+# PlayStation Vita: libchdr builds itself and its codecs position-independent (for shared
+# libraries), and the Vita's executable format takes no GOT-relative relocations
+# (vita-elf-create: "Invalid relocation type 25").
+if(GT3R_VITA)
+  foreach(_t chdr-static chdr-lzma miniz zstd)
+    if(TARGET ${_t})
+      set_target_properties(${_t} PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+    endif()
+  endforeach()
+endif()
 
 # --- SDL3: windowing, input (gamepads, wheels, sensors), audio, GPU ---------
 # Release packages build SDL from source (GT3R_FETCH_SDL) so they don't depend
