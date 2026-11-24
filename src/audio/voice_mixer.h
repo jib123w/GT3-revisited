@@ -191,6 +191,9 @@ private:
     Interpolation interp_ = Interpolation::Gaussian;
     std::atomic<bool> surround_cue_{false};
     SpuReverb reverb_;
+    // PlayStation Vita (render, kHalfRate): the voices are worked out once every two output samples;
+    // the last pair's dry and wet sums, for the halfway sample before the next pair's.
+    s32 last_dry_[2] = {}, last_wet_[2] = {};
     int reverb_mode_ = SpuReverb::Off; // as last set (reverb_ takes it after a rendering block)
     s16 reverb_depth_ = 0;
 

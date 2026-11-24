@@ -325,6 +325,13 @@ private:
         u32 moved_axes = 0; // axes seen away from where they started (note_moved_axes)
         bool dualsense = false; // a PlayStation 5 controller (Modern rumble's mix for it, dualsense_rumble)
         std::string serial, path; // for device tags (DeviceId); empty when not reported
+        // The gamepad's buttons and axes as update() found them (snapshot_pads), read by
+        // read_source during update(): one SDL call each a frame instead of two a binding, every
+        // one of which locks the joysticks and validates the gamepad (4 ms a frame on the
+        // PlayStation Vita). -1: the gamepad has no such button / axis.
+        s8 pad_buttons[SDL_GAMEPAD_BUTTON_COUNT] = {};
+        bool pad_has_axis[SDL_GAMEPAD_AXIS_COUNT] = {};
+        Sint16 pad_axes[SDL_GAMEPAD_AXIS_COUNT] = {};
     };
     struct Player {
         std::string device_filter = "auto"; // [playerN] controller
@@ -399,6 +406,9 @@ private:
     void resend_rumble();                     // window_focus_gained's writes
 
     std::vector<Device> devices_;
+    // Device::pad_* hold this frame's gamepad state (true inside update(): snapshot_pads).
+    bool pads_snapped_ = false;
+    void snapshot_pads();
     std::array<Player, kMaxPlayers> players_;
     PadState any_pad_; // any_device_pad()
     bool menu_rescue_ = false; // menu_pad()

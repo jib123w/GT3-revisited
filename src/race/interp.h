@@ -14,8 +14,13 @@ public:
 
     // Adds frame time; returns the number of ticks to run now (at most
     // `max_ticks`: after a long stall the excess time is dropped instead of
-    // making the game spiral).
+    // making the game spiral). PlayStation Vita: 4, so a frame below 15 a second runs the game
+    // slower instead of piling more ticks onto an already slow frame.
+#if defined(__vita__)
+    int advance(double frame_dt, int max_ticks = 4);
+#else
     int advance(double frame_dt, int max_ticks = 8);
+#endif
     // Ticks paced by a shared clock instead (online races): `clock_ticks` ticks are due by now
     // and `done` have run. Returns the number to run now (at most `max_ticks`) and counts them
     // in `done`; alpha() is then the clock's way into the tick after them (0..1). Frame times

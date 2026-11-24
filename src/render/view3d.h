@@ -115,6 +115,10 @@ struct DrawOptions {
     // view frustum or further than `draw_distance` (0 = unlimited) from the eye.
     bool frustum_cull = false;
     float draw_distance = 0;
+    // Slow machines: the course scenery's meshes (items drawn from a node list, DrawItem::nodes)
+    // smaller than this seen from the eye (bounding-sphere radius over distance) are skipped: far
+    // trackside objects a pixel or two across, each still a draw call (0 = none).
+    float min_size = 0;
     // Draw blended primitives back to front (by mesh bounding-sphere centre)
     // instead of in model order.
     bool sort_blended = false;

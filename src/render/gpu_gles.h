@@ -25,6 +25,8 @@
 // separated.
 #define GT3R_GL_PROP_SHADER_UNIFORM_BLOCKS "gt3r.gl.uniform_blocks"
 #define GT3R_GL_PROP_SHADER_SAMPLERS "gt3r.gl.samplers"
+// Vertex attribute names in location order, bound before the link (the Vita's Cg shaders).
+#define GT3R_GL_PROP_SHADER_ATTRIBUTES "gt3r.gl.attributes"
 
 namespace gt3r::render::gles {
 

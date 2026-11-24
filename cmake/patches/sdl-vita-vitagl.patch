@@ -1,0 +1,227 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 93a99bc..27c8454 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -409,6 +409,7 @@ dep_option(SDL_EXAMPLES_LINK_SHARED "link examples to shared SDL library" "${SDL
+ if(VITA)
+   set_option(VIDEO_VITA_PIB  "Build with PSVita piglet gles2 support" OFF)
+   set_option(VIDEO_VITA_PVR  "Build with PSVita PVR gles/gles2 support" OFF)
++  set_option(VIDEO_VITA_VITAGL "Build with PSVita vitaGL (OpenGL ES 3.0 subset) support" OFF)
+ endif()
+ 
+ if (NGAGE)
+@@ -3064,6 +3065,35 @@ elseif(VITA)
+       endif()
+     endif()
+ 
++    if(VIDEO_VITA_VITAGL)
++      check_include_file(vitaGL.h HAVE_VITAGL_H)
++      if(HAVE_VITAGL_H)
++        set(HAVE_OPENGLES TRUE)
++        set(SDL_VIDEO_OPENGL_ES2 1)
++        set(SDL_VIDEO_RENDER_OGL_ES2 1)
++        # vitaGL first, then what it calls: its shader compiler front end (vitaShaRK, Sony's
++        # SceShaccCg, loaded from ur0:data/libshacccg.suprx), math and DMA helpers.
++        sdl_link_dependency(vitagl
++          LIBS
++            vitaGL
++            vitashark
++            SceShaccCgExt
++            mathneon
++            taihen_stub
++            SceShaccCg_stub
++            SceKernelDmacMgr_stub
++            SceCommonDialog_stub
++            SceIme_stub
++            SceAppMgr_stub
++            SceLibKernel_stub
++        )
++        set(HAVE_VIDEO_VITA_VITAGL ON)
++        set(SDL_VIDEO_VITA_VITAGL 1)
++      else()
++        set(HAVE_VIDEO_VITA_VITAGL OFF)
++      endif()
++    endif()
++
+     set(SDL_VIDEO_RENDER_VITA_GXM 1)
+     sdl_link_dependency(base
+       LIBS
+diff --git a/include/build_config/SDL_build_config.h.cmake b/include/build_config/SDL_build_config.h.cmake
+index 17cb8f2..f504656 100644
+--- a/include/build_config/SDL_build_config.h.cmake
++++ b/include/build_config/SDL_build_config.h.cmake
+@@ -571,6 +571,7 @@
+ #cmakedefine SDL_VIDEO_VITA_PIB 1
+ #cmakedefine SDL_VIDEO_VITA_PVR 1
+ #cmakedefine SDL_VIDEO_VITA_PVR_OGL 1
++#cmakedefine SDL_VIDEO_VITA_VITAGL 1
+ 
+ #cmakedefine SDL_EMSCRIPTEN_PERSISTENT_PATH_STRING "@SDL_EMSCRIPTEN_PERSISTENT_PATH_STRING@"
+ 
+diff --git a/src/video/vita/SDL_vitagles_vitagl.c b/src/video/vita/SDL_vitagles_vitagl.c
+new file mode 100644
+index 0000000..36cdc23
+--- /dev/null
++++ b/src/video/vita/SDL_vitagles_vitagl.c
+@@ -0,0 +1,114 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "SDL_internal.h"
++
++#if defined(SDL_VIDEO_DRIVER_VITA) && defined(SDL_VIDEO_VITA_VITAGL)
++
++/* OpenGL ES through vitaGL, an OpenGL implementation on GXM. Unlike Piglet and PVR_PSP2 (OpenGL
++   ES 2.0) it has much of OpenGL ES 3.0: instanced draws, uniform blocks, vertex arrays. vitaGL
++   owns GXM and the display, so SDL's vitagxm renderer must not be created beside it.
++
++   Hints (read once, when the first context is created):
++     SDL_VITA_VGL_RAM_THRESHOLD  bytes of main memory vitaGL leaves for everyone else (8 MB)
++     SDL_VITA_VGL_MSAA           0, 2 or 4: the display's multisampling (0) */
++
++#include <vitaGL.h>
++
++#include "SDL_vitavideo.h"
++
++static bool vitagl_ready = false;
++static int vitagl_swap_interval = 1;
++
++bool VITA_VGL_LoadLibrary(SDL_VideoDevice *_this, const char *path)
++{
++    return true; // linked in
++}
++
++SDL_FunctionPointer VITA_VGL_GetProcAddress(SDL_VideoDevice *_this, const char *proc)
++{
++    return (SDL_FunctionPointer)vglGetProcAddress(proc);
++}
++
++void VITA_VGL_UnloadLibrary(SDL_VideoDevice *_this)
++{
++}
++
++SDL_GLContext VITA_VGL_CreateContext(SDL_VideoDevice *_this, SDL_Window *window)
++{
++    SDL_WindowData *wdata = window->internal;
++
++    if (!vitagl_ready) {
++        const char *threshold_hint = SDL_GetHint("SDL_VITA_VGL_RAM_THRESHOLD");
++        const char *msaa_hint = SDL_GetHint("SDL_VITA_VGL_MSAA");
++        const int threshold = threshold_hint ? SDL_atoi(threshold_hint) : 8 * 1024 * 1024;
++        const int samples = msaa_hint ? SDL_atoi(msaa_hint) : 0;
++        const SceGxmMultisampleMode msaa = samples >= 4 ? SCE_GXM_MULTISAMPLE_4X
++                                         : samples >= 2 ? SCE_GXM_MULTISAMPLE_2X
++                                                        : SCE_GXM_MULTISAMPLE_NONE;
++        // No legacy (glBegin/glEnd) pool: OpenGL ES has no immediate mode. The return value is
++        // not success: GL_TRUE says the size was lowered to the display's largest, and an init
++        // at 960x544 that worked returns GL_FALSE. vitaGL has no failure return.
++        (void)vglInitExtended(0, 960, 544, threshold, msaa);
++        vglWaitVblankStart(vitagl_swap_interval != 0 ? GL_TRUE : GL_FALSE);
++        vitagl_ready = true;
++    }
++
++    wdata->uses_gles = true;
++    window->flags |= SDL_WINDOW_FULLSCREEN;
++
++    // vitaGL has a single context; any non-NULL handle stands for it.
++    return (SDL_GLContext)window;
++}
++
++bool VITA_VGL_MakeCurrent(SDL_VideoDevice *_this, SDL_Window *window, SDL_GLContext context)
++{
++    return true;
++}
++
++bool VITA_VGL_SetSwapInterval(SDL_VideoDevice *_this, int interval)
++{
++    vitagl_swap_interval = interval;
++    if (vitagl_ready) {
++        vglWaitVblankStart(interval != 0 ? GL_TRUE : GL_FALSE);
++    }
++    return true;
++}
++
++bool VITA_VGL_GetSwapInterval(SDL_VideoDevice *_this, int *interval)
++{
++    *interval = vitagl_swap_interval;
++    return true;
++}
++
++bool VITA_VGL_SwapWindow(SDL_VideoDevice *_this, SDL_Window *window)
++{
++    SDL_VideoData *videodata = _this->internal;
++    // An open IME dialog draws itself over the frame being presented.
++    vglSwapBuffers(videodata->ime_active ? GL_TRUE : GL_FALSE);
++    return true;
++}
++
++bool VITA_VGL_DestroyContext(SDL_VideoDevice *_this, SDL_GLContext context)
++{
++    return true; // vitaGL lives as long as the process
++}
++
++#endif // SDL_VIDEO_DRIVER_VITA && SDL_VIDEO_VITA_VITAGL
+diff --git a/src/video/vita/SDL_vitavideo.c b/src/video/vita/SDL_vitavideo.c
+index 4efaaed..6c1a6d7 100644
+--- a/src/video/vita/SDL_vitavideo.c
++++ b/src/video/vita/SDL_vitavideo.c
+@@ -117,7 +117,17 @@ static SDL_VideoDevice *VITA_Create(void)
+         device->DestroyWindowFramebuffer = VITA_DestroyWindowFramebuffer;
+     */
+ 
+-#if defined(SDL_VIDEO_VITA_PIB) || defined(SDL_VIDEO_VITA_PVR)
++#if defined(SDL_VIDEO_VITA_VITAGL)
++    device->GL_LoadLibrary = VITA_VGL_LoadLibrary;
++    device->GL_CreateContext = VITA_VGL_CreateContext;
++    device->GL_GetProcAddress = VITA_VGL_GetProcAddress;
++    device->GL_UnloadLibrary = VITA_VGL_UnloadLibrary;
++    device->GL_MakeCurrent = VITA_VGL_MakeCurrent;
++    device->GL_SetSwapInterval = VITA_VGL_SetSwapInterval;
++    device->GL_GetSwapInterval = VITA_VGL_GetSwapInterval;
++    device->GL_SwapWindow = VITA_VGL_SwapWindow;
++    device->GL_DestroyContext = VITA_VGL_DestroyContext;
++#elif defined(SDL_VIDEO_VITA_PIB) || defined(SDL_VIDEO_VITA_PVR)
+ #ifdef SDL_VIDEO_VITA_PVR_OGL
+     if (SDL_GetHintBoolean(SDL_HINT_VITA_PVR_OPENGL, false)) {
+         device->GL_LoadLibrary = VITA_GL_LoadLibrary;
+diff --git a/src/video/vita/SDL_vitavideo.h b/src/video/vita/SDL_vitavideo.h
+index 4657f14..90c7214 100644
+--- a/src/video/vita/SDL_vitavideo.h
++++ b/src/video/vita/SDL_vitavideo.h
+@@ -98,6 +98,19 @@ extern SDL_GLContext VITA_GL_CreateContext(SDL_VideoDevice *_this, SDL_Window *w
+ extern SDL_FunctionPointer VITA_GL_GetProcAddress(SDL_VideoDevice *_this, const char *proc);
+ #endif
+ 
++#ifdef SDL_VIDEO_VITA_VITAGL
++// OpenGL ES through vitaGL (SDL_vitagles_vitagl.c)
++extern bool VITA_VGL_LoadLibrary(SDL_VideoDevice *_this, const char *path);
++extern SDL_FunctionPointer VITA_VGL_GetProcAddress(SDL_VideoDevice *_this, const char *proc);
++extern void VITA_VGL_UnloadLibrary(SDL_VideoDevice *_this);
++extern SDL_GLContext VITA_VGL_CreateContext(SDL_VideoDevice *_this, SDL_Window *window);
++extern bool VITA_VGL_MakeCurrent(SDL_VideoDevice *_this, SDL_Window *window, SDL_GLContext context);
++extern bool VITA_VGL_SetSwapInterval(SDL_VideoDevice *_this, int interval);
++extern bool VITA_VGL_GetSwapInterval(SDL_VideoDevice *_this, int *interval);
++extern bool VITA_VGL_SwapWindow(SDL_VideoDevice *_this, SDL_Window *window);
++extern bool VITA_VGL_DestroyContext(SDL_VideoDevice *_this, SDL_GLContext context);
++#endif
++
+ // OpenGLES functions
+ extern bool VITA_GLES_LoadLibrary(SDL_VideoDevice *_this, const char *path);
+ extern SDL_FunctionPointer VITA_GLES_GetProcAddress(SDL_VideoDevice *_this, const char *proc);

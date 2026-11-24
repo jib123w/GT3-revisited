@@ -9,6 +9,7 @@ namespace gt3r::race_screen {
 
 // The race's music cues (music §2-3), every frame.
 void RaceScreen::music_cues(App& app) {
+    GT3R_PROF("race.music_cues");
     app.music_library().racing(); // songs' loudness measured between races
     RaceMusic::Cues c;
     c.music_on = replaying_ || demo_ || attract_ ? preset_.music && view_settings().bgm_on() : music_on_;
@@ -79,6 +80,7 @@ void RaceScreen::music_cues(App& app) {
 }
 
 void RaceScreen::song_controls(App& app, double dt) {
+    GT3R_PROF("race.song_controls");
     InputManager& in = app.input();
     int pressed = 0, held = 0;
     for (int p = 0; p < InputManager::kMaxPlayers; ++p) {
@@ -101,6 +103,7 @@ void RaceScreen::skip_song(App& app, int dir) {
 
 // CRSS course ambience: one listener per screen, every car's track distance.
 void RaceScreen::update_course_ambience(App& app) {
+    GT3R_PROF("race.ambience");
     if (!crss_ok_) return;
     auto listener = [&](const CameraRig& cam, const sim::VehicleState& car) {
         CourseAmbience::Listener l;
@@ -175,6 +178,7 @@ void place_extra(CarExtraSounds::Frame& f, const CarPlace& p, float doppler) {
 // GT3 sends every car's sounds the same way (sound §6-§8): one view per car from the camera's kind and whether it is the
 // camera's target, every unit and loop faded by 32/d from the camera and moved by the Doppler of the car and the camera.
 void RaceScreen::update_car_sounds(App& app, double dt) {
+    GT3R_PROF("race.car_sounds");
     if (!se_on()) return;
     VoiceMixer& mixer = app.audio().voices();
     const SoundListener l = sound_listener();
@@ -240,6 +244,7 @@ void RaceScreen::update_car_sounds(App& app, double dt) {
 // Every car runs the tyre routine (sound §7.6): its wheels' loops placed from the camera with its view's gains, and
 // the followed cars' collision one-shots.
 void RaceScreen::update_tyre_sounds(App& app, const sim::VehicleState& s) {
+    GT3R_PROF("race.tyre_sounds");
     VoiceMixer& mixer = app.audio().voices();
     auto step = [](const CameraRig& cam, const sim::VehicleState& st, const sim::VehicleSetup& setup,
                    const sim::VehicleTelemetry* t, SoundView view) {

@@ -428,6 +428,16 @@ void VoiceMixer::render_block(s16* out, size_t frames) {
     changes_.clear();
 }
 
+#if defined(__vita__)
+// The PlayStation Vita mixes the race's ~46 voices in the SPU2's own way on a 444 MHz core: that
+// took 96% of it and the sound broke up. Its voices are worked out once every two output samples
+// (24 kHz), the first sample of each pair halfway from the pair before; the reverb still runs on
+// every sample (its own timing and filters).
+constexpr bool kHalfRate = true;
+#else
+constexpr bool kHalfRate = false;
+#endif
+
 void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
     const s32 master = p.master;
     const bool gauss = p.gauss;
@@ -437,12 +447,14 @@ void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
     auto scaled = [&p](const s32 (&sum)[2]) {
         return s32((s64(sum[0]) * p.bus_gain[0] + s64(sum[1]) * p.bus_gain[1]) >> 16);
     };
-    for (size_t n = 0; n < frames; ++n) {
+    for (size_t n = 0; n < frames;) {
+        // Output samples this pass of the voices: 1, or 2 at half rate (the block's odd last one alone).
+        const int step = kHalfRate && n + 1 < frames ? 2 : 1;
         s32 bus_l[2] = {}, bus_r[2] = {}, bus_wet_l[2] = {}, bus_wet_r[2] = {};
         for (Voice& v : block_) {
             if (v.phase == Phase::Off) continue;
-            // Advance the source position by pitch/0x1000 samples.
-            v.counter += v.hw_pitch;
+            // Advance the source position by pitch/0x1000 samples (a sample's worth each output sample).
+            v.counter += u32(v.hw_pitch) * u32(step);
             while (v.counter >= 0x1000 && !v.ended) {
                 v.counter -= 0x1000;
                 s32 s = next_sample(v);
@@ -474,28 +486,38 @@ void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
                 sample = s32(std::clamp<s64>(val / 2, -32768, 32767));
             }
 
-            step_envelope(v);
+            for (int k = 0; k < step; ++k) step_envelope(v); // (the envelope's steps are per output sample)
             s32 e = s32((s64(sample) * v.env) >> 15);
 
             // Slew volume towards the target.
-            v.vol_l += std::clamp(v.target_l - v.vol_l, -kVolSlew, kVolSlew);
-            v.vol_r += std::clamp(v.target_r - v.vol_r, -kVolSlew, kVolSlew);
+            const s32 slew = kVolSlew * step;
+            v.vol_l += std::clamp(v.target_l - v.vol_l, -slew, slew);
+            v.vol_r += std::clamp(v.target_r - v.vol_r, -slew, slew);
             s32 l = (e * v.vol_l) >> 14, r = (e * v.vol_r) >> 14;
             bus_l[v.bus] += l;
             bus_r[v.bus] += r;
             if (v.reverb) bus_wet_l[v.bus] += l, bus_wet_r[v.bus] += r;
             if (v.phase == Phase::Off) v.data.reset();
         }
-        s32 acc_l = scaled(bus_l), acc_r = scaled(bus_r);
-        if (rev) {
-            const s32 wet_l = scaled(bus_wet_l), wet_r = scaled(bus_wet_r);
-            s32 rl, rr;
-            reverb_.process(wet_l, wet_r, rl, rr);
-            acc_l += rl;
-            acc_r += rr;
+        const s32 dry[2] = {scaled(bus_l), scaled(bus_r)};
+        const s32 wet[2] = {rev ? scaled(bus_wet_l) : 0, rev ? scaled(bus_wet_r) : 0};
+        for (int k = 0; k < step; ++k) {
+            const bool half = k == 0 && step == 2; // a pair's first sample: halfway from the pair before
+            s32 acc_l = half ? (last_dry_[0] + dry[0]) / 2 : dry[0];
+            s32 acc_r = half ? (last_dry_[1] + dry[1]) / 2 : dry[1];
+            if (rev) {
+                s32 rl, rr;
+                reverb_.process(half ? (last_wet_[0] + wet[0]) / 2 : wet[0], half ? (last_wet_[1] + wet[1]) / 2 : wet[1],
+                                rl, rr);
+                acc_l += rl;
+                acc_r += rr;
+            }
+            const size_t f = n + size_t(k);
+            out[2 * f] = s16(std::clamp((acc_l * master) >> 12, -32768, 32767));
+            out[2 * f + 1] = s16(std::clamp((acc_r * master) >> 12, -32768, 32767));
         }
-        out[2 * n] = s16(std::clamp((acc_l * master) >> 12, -32768, 32767));
-        out[2 * n + 1] = s16(std::clamp((acc_r * master) >> 12, -32768, 32767));
+        last_dry_[0] = dry[0], last_dry_[1] = dry[1], last_wet_[0] = wet[0], last_wet_[1] = wet[1];
+        n += size_t(step);
     }
 }
 

@@ -1,9 +1,15 @@
 #include "race/race_scene.h"
 
 #include "base/log.h"
+#include "base/prof.h"
 #include "formats/course/course_model.h"
 #include "formats/model/wheel_model.h"
 #include "race/interp.h"
+
+#if defined(__vita__)
+#include <psp2/kernel/cpu.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -58,9 +64,16 @@ render::Mat4 car_matrix(const sim::VehicleState& s) {
     return render::translate({s.position.x, s.position.y, s.position.z}) * render::rotate_quat(q.w, q.x, q.y, q.z);
 }
 
+namespace {
+float g_car_lod_scale = 1.0f; // (set_car_lod_scale: the main thread's)
+}
+
+void set_car_lod_scale(float scale) { g_car_lod_scale = std::clamp(scale, 0.1f, 1.0f); }
+
 int car_lod(float dist, int lods, bool full_detail) {
     if (full_detail) return 0;
-    return std::max(0, std::min(dist < 30 ? 0 : dist < 80 ? 1 : 2, lods - 1));
+    const float near = 30.0f * g_car_lod_scale, mid = 80.0f * g_car_lod_scale;
+    return std::max(0, std::min(dist < near ? 0 : dist < mid ? 1 : 2, lods - 1));
 }
 
 CourseScene::CourseScene(render::GpuContext& ctx, ByteSpan data, const std::string& name, bool sheen)
@@ -198,6 +211,10 @@ void CourseScene::set_moving(Moving& m, render::GpuContext& ctx, const render::G
 
 void CourseScene::restart_animations(float countdown) {
     cluts_.restart(countdown);
+#if defined(__vita__)
+    wait_moving_job(); // (the worker reads the nodes)
+    moving_pending_ = 0;
+#endif
     for (Moving* m : {&scenery_moving_, &backdrop_moving_})
         for (gtm1::AnimatedNodes& a : m->nodes) a.reset();
     moving_changed_ = true;
@@ -205,13 +222,98 @@ void CourseScene::restart_animations(float countdown) {
 
 void CourseScene::animate(float seconds) {
     cluts_.animate(seconds);
+#if defined(__vita__)
+    // The nodes move once the worker is done reading them; the time waits till then.
+    moving_pending_ += seconds;
+    if (!moving_job_idle()) return;
+    seconds = moving_pending_;
+    moving_pending_ = 0;
+#endif
     for (Moving* m : {&scenery_moving_, &backdrop_moving_})
         for (gtm1::AnimatedNodes& a : m->nodes) a.update(seconds);
     moving_changed_ = moving_changed_ || seconds != 0;
 }
 
+#if defined(__vita__)
+bool CourseScene::moving_job_idle() {
+    if (!job_) return true;
+    std::lock_guard lock(job_->mutex);
+    return !job_->pending && !job_->busy;
+}
+
+void CourseScene::wait_moving_job() {
+    if (!job_) return;
+    std::unique_lock lock(job_->mutex);
+    job_->cv.wait(lock, [this] { return !job_->pending && !job_->busy; });
+}
+
+void CourseScene::moving_worker() {
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
+    std::unique_lock lock(job_->mutex);
+    for (;;) {
+        job_->cv.wait(lock, [this] { return job_->pending || job_->quit; });
+        if (job_->quit) return;
+        job_->pending = false, job_->busy = true;
+        lock.unlock();
+        std::vector<scene::Mesh> out[2];
+        const Moving* moving[2] = {&scenery_moving_, &backdrop_moving_};
+        for (int i = 0; i < 2; ++i) {
+            if (!moving[i]->gpu) continue;
+            for (const gtm1::AnimatedNodes& a : moving[i]->nodes) {
+                std::vector<scene::Mesh> part = a.meshes();
+                for (scene::Mesh& mesh : part) out[i].push_back(std::move(mesh));
+            }
+        }
+        lock.lock();
+        job_->result[0] = std::move(out[0]), job_->result[1] = std::move(out[1]);
+        job_->busy = false, job_->done = true;
+        job_->cv.notify_all();
+    }
+}
+
+CourseScene::~CourseScene() {
+    if (!job_) return;
+    {
+        std::lock_guard lock(job_->mutex);
+        job_->quit = true;
+    }
+    job_->cv.notify_all();
+    if (job_->thread.joinable()) job_->thread.join();
+}
+#endif
+
 void CourseScene::upload_animations() {
-    cluts_.upload();
+    {
+        GT3R_PROF("anim.course_cluts");
+        cluts_.upload();
+    }
+    GT3R_PROF("anim.course_moving");
+#if defined(__vita__)
+    if (!scenery_moving_.gpu && !backdrop_moving_.gpu) return;
+    if (!job_) {
+        job_ = std::make_unique<MovingJob>();
+        job_->thread = std::thread([this] { moving_worker(); });
+    }
+    // What the worker finished goes up; changed nodes start it again.
+    bool took = false;
+    std::vector<scene::Mesh> result[2];
+    {
+        std::lock_guard lock(job_->mutex);
+        if (job_->done) {
+            result[0] = std::move(job_->result[0]), result[1] = std::move(job_->result[1]);
+            job_->done = false, took = true;
+        }
+        if (moving_changed_ && !job_->pending && !job_->busy) {
+            moving_changed_ = false;
+            job_->pending = true;
+            job_->cv.notify_all();
+        }
+    }
+    if (!took) return;
+    Moving* moving[2] = {&scenery_moving_, &backdrop_moving_};
+    for (int i = 0; i < 2; ++i)
+        if (moving[i]->gpu) moving[i]->gpu->update_geometry(result[i]);
+#else
     if (!moving_changed_) return;
     moving_changed_ = false;
     for (Moving* m : {&scenery_moving_, &backdrop_moving_}) {
@@ -223,6 +325,7 @@ void CourseScene::upload_animations() {
         }
         m->gpu->update_geometry(meshes);
     }
+#endif
 }
 
 bool CourseScene::add_env_items(std::vector<render::DrawItem>& items, const render::Vec3& eye,

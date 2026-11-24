@@ -11,6 +11,26 @@
 
 namespace gt3r::race_screen {
 
+// The settings a race follows as they change (read when it starts and every frame, so the Settings
+// tab opened over a race takes effect at once): [video] draw_distance = 100 | 75 | 50 (percent;
+// RaceScreen::draw_options), scenery_animation = full | reduced (RaceScreen::animate_course),
+// rear_mirror = on | off (RaceScreen::draw_mirror), color_grading = on | off (apply_post_pass) and, on
+// the Vita, [race] physics = exact |
+// fast (ee::HostMathScope, base/ee_float.h).
+void RaceScreen::read_live_settings(App& app) {
+    draw_share_ = std::clamp(float(std::atoi(app.video_setting("draw_distance").c_str())) / 100.0f, 0.25f, 1.0f);
+    reduced_animation_ = app.video_setting("scenery_animation") == "reduced";
+    mirror_on_ = app.video_setting("rear_mirror") != "off";
+    grading_on_ = app.video_setting("color_grading") != "off";
+    // [video] car_detail = normal | low (race::car_lod: the simpler models nearer).
+    race::set_car_lod_scale(app.video_setting("car_detail") == "low" ? 1.0f / 3.0f : 1.0f);
+#if defined(__vita__)
+    const bool fast = to_lower(app.config().get("race", "physics").value_or("exact")) == "fast";
+    if (fast != host_math_) LOG_INFO("Race: %s physics", fast ? "fast (the Vita's FPU, not bit for bit)" : "exact");
+    host_math_ = fast;
+#endif
+}
+
 // Loads course, car, track and vehicle for the selected entries. `replay`
 // (optional) is played back instead of driving.
 void RaceScreen::start(App& app, const Replay* replay) {
@@ -24,9 +44,13 @@ void RaceScreen::start(App& app, const Replay* replay) {
     lang_ = app.language();
     if (game::GtModeSession* gs = game::gt_mode_session()) imperial_ = gs->gt().data().units.mph;
     imperial_ = speed_unit().value_or(imperial_);
-    env_cube_on_ = app.config().get("video", "car_reflections").value_or("on") != "off";
+    // (The Vita's default is off: the cube's six faces are six more course passes a frame, and
+    // vitaGL has no cube-face render targets, so each face also goes through the CPU, glReadPixels
+    // waiting for the GPU to finish: gpu_gles.cpp vita_store_face. App::video_setting.)
+    env_cube_on_ = app.video_setting("car_reflections") != "off";
     if (SDL_getenv("GT3R_NO_ENV")) env_cube_on_ = false;
-    shadows_on_ = app.config().get("video", "car_shadows").value_or("on") != "off";
+    shadows_on_ = app.video_setting("car_shadows") != "off";
+    read_live_settings(app);
     full_car_detail_ = app.full_car_detail();
     showroom_wheels_ = app.showroom_wheels();
     heat_haze_ = to_lower(app.config().get("video", "heat_haze").value_or("off")) == "on";
@@ -842,7 +866,13 @@ void RaceScreen::load_opponent_cars(App& app, const RaceField& f) {
                 build_player_visual(app, player_model, *cf);
         }
     }
-    std::map<std::pair<std::string, int>, std::shared_ptr<CarVisual>> by_model;
+    struct Wanted {
+        std::string model;
+        int paint = 0;
+        CarBodyMod bm;
+        OpponentModelKey key;
+    };
+    std::vector<Wanted> wanted;
     for (int i = 0; i < f.opponents(); ++i) {
         const std::string& model = f.opponent_model(i);
         int paint = std::max(0, paints[size_t(i) + 1]);
@@ -855,7 +885,27 @@ void RaceScreen::load_opponent_cars(App& app, const RaceField& f) {
         if (base.empty())
             if (const data::CarVariant* cv = db_.variant(l)) base = cv->car;
         CarBodyMod bm = db_.mod_car(base) ? body_mod_for_car(db_, base, paint, car_scene()) : CarBodyMod{};
-        std::shared_ptr<CarVisual>& v = by_model[{bm.active() ? base : model, paint}];
+        OpponentModelKey key{bm.active() ? base : model, paint};
+        wanted.push_back({model, paint, std::move(bm), std::move(key)});
+    }
+    // The models the field had before (a restart and the pre-race menu build the field again): one in the same paint is kept
+    // rather than read and uploaded again (~2.3 s a car on the PlayStation Vita, two or three times a race's load). Those
+    // this field has no use for are freed first.
+    std::map<OpponentModelKey, std::shared_ptr<CarVisual>> before = std::move(opp_models_);
+    opp_models_.clear();
+    for (auto it = before.begin(); it != before.end();)
+        it = std::any_of(wanted.begin(), wanted.end(), [&](const Wanted& w) { return w.key == it->first; }) ? std::next(it)
+                                                                                                           : before.erase(it);
+    for (const Wanted& want : wanted) {
+        const std::string& model = want.model;
+        const int paint = want.paint;
+        const CarBodyMod& bm = want.bm;
+        std::shared_ptr<CarVisual>& v = opp_models_[want.key];
+        if (!v)
+            if (auto it = before.find(want.key); it != before.end() && it->second) {
+                v = std::move(it->second);
+                v->set_full_detail(full_car_detail_);
+            }
         if (!v) {
             std::optional<Bytes> f = read_car(app, model);
             WheelSpec ws;

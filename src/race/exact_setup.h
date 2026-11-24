@@ -32,6 +32,9 @@ namespace ex = sim::exact;
 // The program data of the disc in `vfs` (its CORE.GT3), checked once per program; null with *error set only when the disc
 // has no program that decodes.
 std::shared_ptr<const ex::ProgramData> exact_program_data(const Vfs& vfs, std::string* error = nullptr);
+// Starts working the program data out on a thread of its own, once a session (the menus call it): it took 15 s of the
+// first race's load on the PlayStation Vita. exact_program_data then has it, or waits for the thread.
+void prefetch_exact_program_data(const Vfs& vfs);
 // The program data a race record plays on: `d` when the record has its fingerprint, else `d`'s GT3 tables
 // (ProgramData::gt3_tables: an online race's or one of the game's demos on a disc with changed tables); null for another
 // program's or tables' record.

@@ -4,6 +4,7 @@
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "platform/render_scale.h"
 
 namespace gt3r::race_screen {
 
@@ -11,6 +12,7 @@ namespace gt3r::race_screen {
 // sphere map every frame; we render a cube): course only, 0.8 m above the player's car,
 // scenery within 200 m. [video] car_reflections = off falls back to the sky/scenery gradient.
 bool RaceScreen::update_env_cube() {
+    GT3R_PROF("race.env_cube");
     if (!env_cube_on_ || !view_ || !course_scene_) return false;
     const sim::Vec3& p = render_state_.position;
     render::Vec3 pos{p.x, p.y + 0.8f, p.z};
@@ -83,6 +85,7 @@ SDL_FRect RaceScreen::mirror_rect(const SDL_FRect& frame, bool half, const Custo
 // player 2's camera / a 4:3 2P half.
 void RaceScreen::draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const render::DrawOptions& main, bool p2,
                              bool half) {
+    GT3R_PROF("race.mirror");
     const CameraRig& cam = p2 ? camera2_ : camera_;
     const CustomCamera* custom = cam.custom();
     const float size = custom ? custom->mirror_size : 1.0f;
@@ -278,6 +281,7 @@ TyreSmoke::View RaceScreen::smoke_view(const CameraRig& c, float aspect, float f
 // Draw items seen from `eye`: course, every car, the ghost.
 void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, bool player,
                                bool second, const TyreSmoke::View& smoke_v, ItemsView view, int seat) {
+    GT3R_PROF("race.collect");
     const bool mirror = view == ItemsView::Mirror || view == ItemsView::SplitMirror;
     using course::SceneryView;
     const SceneryView scenery = view == ItemsView::Split         ? SceneryView::Split
@@ -410,6 +414,7 @@ float hud_top_speed_kmh(const CarSetup& c) {
 }
 
 HudData RaceScreen::hud_data(int player) {
+    GT3R_PROF("race.hud_data");
     HudData d;
     d.imperial = imperial_;
     bool p2 = player == 1;
@@ -617,6 +622,7 @@ HudData RaceScreen::hud_data(int player) {
 // (N = Env0 +0x9E8, at 448 lines); we cast a 3 x 3 grid of rays through that box against
 // the course's opaque triangles and use the fraction that gets through.
 float RaceScreen::sun_visibility(const render::Vec3& eye, float fovy, float rect_h) {
+    GT3R_PROF("race.sun_visibility");
     const SunParams& sp = sun_.params();
     if (!sp.enabled || !course_scene_ || course_scene_->occluder().empty()) return 1.0f;
     (void)rect_h;
@@ -663,6 +669,14 @@ render::DrawOptions RaceScreen::draw_options() const {
     // GT3's far plane (Env0 +0x20; CameraRig::gt3_far) is the race view's only draw distance.
     o.far_clip = camera_.gt3_far;
     o.draw_distance = o.far_clip > 0 ? 0 : 2500;
+    // [video] draw_distance under 100%: what lies wholly beyond that share of it is left out (the
+    // sky and backdrop excepted: View3D's culled), fewer draws for slow machines; the far plane
+    // still clips the rest as GT3 does.
+    if (draw_share_ < 1.0f) o.draw_distance = (o.far_clip > 0 ? o.far_clip : 2500.0f) * draw_share_;
+    // ... and the scenery's small far objects go too (DrawOptions::min_size): under ~3 pixels across
+    // at the 3D resolutions those settings go with (Performance 75%, Max performance 50%). On Trial
+    // Mountain the frame rate followed the draw calls: 500 a frame 28 fps, 1,200 16 fps.
+    if (draw_share_ < 1.0f) o.min_size = draw_share_ <= 0.5f ? 0.005f : 0.003f;
     o.fog = true;
     o.fog_start = 350;
     o.fog_end = 3000;
@@ -709,6 +723,7 @@ render::DrawOptions RaceScreen::draw_options() const {
 // heat haze lenses and the vignette belong to the 1P frame's replays.
 void RaceScreen::add_screen_passes(render::DrawOptions& o, const SDL_FRect& rect, const CameraRig& cam,
                                    float sun_visibility, bool second, bool split, const GlowCars* glow) {
+    GT3R_PROF("race.screen_passes");
     if (!second) ++view_frame_;
     render::ScreenBatch& ob = second ? overlay2_batch_ : overlay_batch_;
     ob.clear();
@@ -749,6 +764,7 @@ void RaceScreen::add_screen_passes(render::DrawOptions& o, const SDL_FRect& rect
 }
 
 void RaceScreen::render_drive(App& app, Ui& ui) {
+    GT3R_PROF("race.render_drive");
     app.note_race_scale();
     upload_course_animations(); // once per frame
     // The game area (App::aspect): 640 x 360 at 16:9, 480 x 360 at 4:3 (GT3's 4:3 picture),
@@ -873,11 +889,15 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
     // This view's post-process passes (presentation §G16): the dissolve's frozen picture at
     // trunc(128 x^3) / 128, view mode 1's trail at trunc(128 a) / 128; every picture kept.
     render::DrawOptions ov = o;
-    ov.keep_last = true;
     ov.snapshot = dissolve_.snapshot;
     dissolve_.snapshot = false;
     ov.dissolve = dissolve_.weight();
     ov.trail = trail_ ? std::floor(128.0f * director_.look().trail_weight()) / 128.0f : 0.0f;
+    // Slow machines (platform::low_power) keep the pictures only where the dissolves and the
+    // trail are (replays, demonstrations, the menu's race): a live run's rare dissolve then cuts
+    // (View3D: no kept picture, no dissolve). The copy took 3 ms a frame on the Vita.
+    ov.keep_last = !platform::low_power() || replaying_ || attract_ || demo_replay() || race_preview_ ||
+                   ov.trail > 0 || ov.dissolve > 0;
     if (!split) apply_depth_of_field(ov);
     // The passes between the scene and the grade (the glare and lamp glows inside the picture, the
     // heat haze) and the vignette (presentation §L6).
@@ -885,12 +905,14 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
     if (debug_ && sun_.params().enabled && (++sun_log_ % 60) == 0) LOG_INFO("sun visibility %.2f", sun_v);
     const GlowCars glow = has_glows() ? glow_cars(own_car, true, hidden) : GlowCars{};
     add_screen_passes(ov, rect, camera_, sun_v, false, split, &glow);
+#if !defined(__vita__) // (the Vita: no CPU clipping at GT3's guard band, View3D::upload_clipped; the GPU clips)
     ov.guard_near = camera_.gt3_near();
+#endif
     view_->draw(ui.renderer(), rect, camera_.view(), camera_.projection(rect.w / rect.h), eye, items_, ov);
     remove_wet_road(wet_items); // (the wet road's frame items belong to this view only)
     hitch::draw_ms = double(SDL_GetTicksNS() - h_c1) / 1e6;
     hitch::meshes = view_->stats().meshes_drawn;
-    if (!replaying_ && !demo_replay() && !race_preview_ && camera_.shows_mirror() && (!split || horizontal)) // (no mirror in a replay's or demonstration's driver's view)
+    if (!replaying_ && !demo_replay() && !race_preview_ && mirror_on_ && camera_.shows_mirror() && (!split || horizontal)) // (no mirror in a replay's or demonstration's driver's view)
         draw_mirror(app, ui, rect, o, false, split);
     if (split) {
         if (!view2_) view2_ = std::make_unique<render::View3D>(*app.gpu());
@@ -903,9 +925,11 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
         wheel_view_ = nullptr;
         render::DrawOptions o2 = o;
         add_screen_passes(o2, rect2, camera2_, sun_visibility(eye2, camera2_.fovy(), rect2.h), true, true, nullptr);
+#if !defined(__vita__)
         o2.guard_near = camera2_.gt3_near();
+#endif
         view2_->draw(ui.renderer(), rect2, camera2_.view(), camera2_.projection(rect2.w / rect2.h), eye2, items_, o2);
-        if (horizontal && !replaying_ && camera2_.shows_mirror())
+        if (horizontal && !replaying_ && mirror_on_ && camera2_.shows_mirror())
             draw_mirror(app, ui, rect2, o, true, true);
     }
     } // (the flat views)
@@ -1077,6 +1101,7 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
 // streaks) rendered and blurred, then the frame items (alpha clear, slot 13 mask, composite).
 size_t RaceScreen::add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
                                 const render::Frustum& fr, const render::DrawOptions& o) {
+    GT3R_PROF("race.wet_road");
     wet_items_.clear();
     std::vector<WetRoad::Car> cars;
     auto add = [&](const CarVisual* v, const sim::VehicleState& s, const sim::VehicleSetup& su, size_t idx) {
@@ -1106,6 +1131,7 @@ size_t RaceScreen::add_wet_road(const render::Vec3& eye, const render::Mat4& vie
 // The cars a view draws, for the glow passes: their lamps (GT3 visits each car's lamps from its car
 // pass, so only the drawn cars': not the camera's own car on board) and their bodies.
 RaceScreen::GlowCars RaceScreen::glow_cars(bool player, bool second, int hidden_opponent) const {
+    GT3R_PROF("race.glow_cars");
     GlowCars out;
     auto add = [&](const CarVisual* v, const sim::VehicleState& s, const sim::VehicleSetup& su, size_t idx) {
         if (!v) return;

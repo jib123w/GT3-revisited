@@ -52,6 +52,14 @@ endif()
 if(IOS)
   set(GT3R_FETCH_SDL ON)
 endif()
+# PlayStation Vita: VitaSDK's SDL3 has no OpenGL, and SDL's own Vita GL backends stop at OpenGL ES
+# 2.0, so SDL is built here with a vitaGL backend (patches/sdl-vita-vitagl.patch, docs/dev/VITA.md).
+# SDL's CMake knows the Vita by VITA, which VitaSDK's toolchain file does not set.
+if(GT3R_VITA)
+  set(GT3R_FETCH_SDL ON)
+  set(VITA ON)
+  set(VIDEO_VITA_VITAGL ON CACHE BOOL "" FORCE)
+endif()
 if(NOT GT3R_FETCH_SDL)
   find_package(SDL3 CONFIG QUIET)
 endif()
@@ -71,8 +79,13 @@ if(NOT SDL3_FOUND)
   if(GT3R_XR)
     set(_sdl_patch sdl-main-vulkan-amd-fullscreen.patch)
   endif()
+  set(_sdl_patches ${CMAKE_CURRENT_LIST_DIR}/patches/${_sdl_patch})
+  if(GT3R_VITA)
+    list(APPEND _sdl_patches ${CMAKE_CURRENT_LIST_DIR}/patches/sdl-vita-vitagl.patch)
+  endif()
+  list(JOIN _sdl_patches "|" _sdl_patch_list) # ApplyPatches.cmake: '|' survives PATCH_COMMAND
   set(GT3R_SDL_PATCH PATCH_COMMAND "${CMAKE_COMMAND}" "-DGIT=${GIT_EXECUTABLE}"
-      "-DPATCHES=${CMAKE_CURRENT_LIST_DIR}/patches/${_sdl_patch}"
+      "-DPATCHES=${_sdl_patch_list}"
       -P "${CMAKE_CURRENT_LIST_DIR}/ApplyPatches.cmake")
   FetchContent_Declare(SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
@@ -104,6 +117,38 @@ if(GT3R_XR)
          PATTERNS native/x64/release/bin/openxr_loader.dll)
     set(GT3R_OPENXR_LOADER ${_openxr}/native/x64/release/bin/openxr_loader.dll)
   endif()
+endif()
+
+# --- vitaGL (PlayStation Vita): built here instead of VitaSDK's package ---------
+# The package has no uniform blocks in its GLSL translator, which every shader here uses, and no
+# error handling, so a shader it cannot compile crashes in glLinkProgram instead of failing the
+# link. HAVE_GLSL_UBOS: uniform blocks. LOG_ERRORS, HAVE_SHARK_LOG: its errors and the shader
+# compiler's go to gt3r.log (patches/vitagl-log.patch: vgl_log -> gt3r_vgl_log in
+# src/app/vita_process.cpp). HAVE_GC_ON_FINISH: glFinish also frees what its garbage collector holds back
+# for 4 frames (a load, with no frames between, ran out of memory with the menus' freed models still
+# held). The game links it ahead of VitaSDK's (CMakeLists.txt).
+if(GT3R_VITA)
+  include(ExternalProject)
+  find_package(Git REQUIRED)
+  ExternalProject_Add(vitagl
+    GIT_REPOSITORY https://github.com/Rinnegatamante/vitaGL.git
+    GIT_TAG f33b63c7466f89c94febf3ed8e4e76179f0b692a
+    # vitagl-packed-offsets.patch: interleaved attributes from a buffer past 64 KB wrapped the
+    # 16-bit SceGxmVertexAttribute.offset (meshes far into a buffer read the wrong vertices).
+    # vitagl-mip-stride.patch: glTexSubImage2D into a mip level of a recently drawn texture
+    # wrote its rows at an uninitialised stride. vitagl-reserve-checks.patch: the GXM uniform reserves
+    # of the clear, the scissor set-up and the blit unchecked (no scene begun: a crash at a race's end).
+    PATCH_COMMAND "${CMAKE_COMMAND}" "-DGIT=${GIT_EXECUTABLE}"
+                  "-DPATCHES=${CMAKE_CURRENT_LIST_DIR}/patches/vitagl-log.patch|${CMAKE_CURRENT_LIST_DIR}/patches/vitagl-packed-offsets.patch|${CMAKE_CURRENT_LIST_DIR}/patches/vitagl-mip-stride.patch|${CMAKE_CURRENT_LIST_DIR}/patches/vitagl-reserve-checks.patch"
+                  -P "${CMAKE_CURRENT_LIST_DIR}/ApplyPatches.cmake"
+    UPDATE_DISCONNECTED TRUE
+    CONFIGURE_COMMAND ""
+    BUILD_IN_SOURCE TRUE
+    BUILD_COMMAND $(MAKE) HAVE_GLSL_UBOS=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 HAVE_GC_ON_FINISH=1
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS <SOURCE_DIR>/libvitaGL.a)
+  ExternalProject_Get_Property(vitagl SOURCE_DIR)
+  set(GT3R_VITAGL_DIR ${SOURCE_DIR})
 endif()
 
 # --- zlib: GT3 stores compressed files as gzip / raw deflate ---------------

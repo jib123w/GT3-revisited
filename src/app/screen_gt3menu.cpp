@@ -38,6 +38,7 @@
 #include "menu/menu_renderer.h"
 #include "menu/menu_scene.h"
 #include "menu/menu_text.h"
+#include "race/exact_setup.h"
 #include "text/game_font.h"
 #include "video/ipu.h"
 #include "video/movie_player.h"
@@ -161,6 +162,9 @@ public:
     void update(App& app, double dt) override {
         if (!flow_ && !init_tried_) {
             init_tried_ = true, init(app); // once: a failure shows its error (no retry every frame)
+            // The races' program data, worked out behind the menus (race::prefetch_exact_program_data: 15 s of
+            // the first race's load on the Vita).
+            if (app.vfs()) race::prefetch_exact_program_data(*app.vfs());
             if (flow_ && in_game_) return;  // (a script that started a race at once: back here when it ends)
         }
         if (!flow_) {
@@ -598,6 +602,12 @@ private:
         LOG_INFO("gt3menu: %s", buf);
         messages_.push_back({buf, 300});
         if (const menu::flow::GtModeWidgetRelease& release = menu::flow::gt_mode_widget_release()) release(app);
+#if defined(SDL_PLATFORM_VITA)
+        // ... and their memory free before the race loads: vitaGL holds what is released for 4 frames, and
+        // the load has none (glFinish frees it: HAVE_GC_ON_FINISH). Without it the next race ran out of
+        // memory ("The race cannot start: std::bad_alloc").
+        if (app.gpu()) SDL_WaitForGPUIdle(app.gpu()->device());
+#endif
         // The race keeps this frame and its transition on screen while it loads (menus §6);
         // the slot is emptied again once the request has been handed on.
         menu::flow::LoadingPicture& loading = menu::flow::race_loading_picture();

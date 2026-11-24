@@ -48,4 +48,12 @@ bool is_mobile() {
 #endif
 }
 
+bool low_power() {
+#if defined(SDL_PLATFORM_VITA)
+    return true;
+#else
+    return is_mobile();
+#endif
+}
+
 } // namespace gt3r::platform

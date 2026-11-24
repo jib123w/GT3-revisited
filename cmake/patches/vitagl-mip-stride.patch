@@ -1,0 +1,15 @@
+diff --git a/source/textures.c b/source/textures.c
+index 37e36b1..70d585c 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1273,8 +1273,9 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ 				for (int j = 0; j < level; j++) {
+ 					ptr += jumps[j];
+ 				}
++				mip_stride = po2_w >> level; // (was left unset on this path)
+ 			}
+-			mip_w = orig_w / (2 * level);
++			mip_w = MAX(orig_w >> level, 1);
+ 			mip_stride = VGL_ALIGN(mip_stride, 8) * bpp;
+ 		} else {
+ 			mip_w = orig_w;

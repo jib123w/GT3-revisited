@@ -43,4 +43,10 @@ int default_msaa(bool mobile);
 // True on Android and iOS builds.
 bool is_mobile();
 
+// True where the lighter graphics defaults apply (no full car detail, depth of field or showroom
+// wheels; dynamic resolution on): phones and tablets, and the PlayStation Vita, which is no
+// touch-first device (is_mobile() also brings the touch controls) but has a phone-class GPU and
+// much less of one. The Vita also starts with the car reflections off (docs/dev/VITA.md).
+bool low_power();
+
 } // namespace gt3r::platform

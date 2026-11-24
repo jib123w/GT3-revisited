@@ -1,5 +1,7 @@
 #include "race/clut_animations.h"
 
+#include "base/prof.h"
+
 namespace gt3r::race {
 
 void ClutAnimations::add(render::GpuModel* model, std::vector<gtm1::ClutSet>&& sets) {
@@ -23,7 +25,10 @@ void ClutAnimations::upload() {
     for (Model& m : models_) {
         std::vector<render::GpuModel::TextureUpdate> updates;
         for (gtm1::ClutSet& s : m.sets)
-            for (u32 r : s.textures.refresh()) updates.push_back({size_t(s.first) + r, s.textures.rgba(r)});
+            for (u32 r : s.textures.refresh()) {
+                GT3R_PROF("anim.recolor");
+                updates.push_back({size_t(s.first) + r, s.textures.rgba(r)});
+            }
         if (!updates.empty()) m.gpu->update_textures(updates);
     }
 }

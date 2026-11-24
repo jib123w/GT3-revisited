@@ -746,10 +746,21 @@ std::optional<float> InputManager::read_source(const Player& p, const Device* de
         if (!keyboard) return std::nullopt;
         return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_MASK(src.code)) ? 1.0f : 0.0f;
     case InputSource::Kind::PadButton:
-        if (!dev || !dev->gamepad || !SDL_GamepadHasButton(dev->gamepad, SDL_GamepadButton(src.code))) return std::nullopt;
+        if (!dev || !dev->gamepad) return std::nullopt;
+        if (pads_snapped_ && src.code >= 0 && src.code < SDL_GAMEPAD_BUTTON_COUNT) { // (this frame's: snapshot_pads)
+            const s8 b = dev->pad_buttons[src.code];
+            if (b < 0) return std::nullopt;
+            return b ? 1.0f : 0.0f;
+        }
+        if (!SDL_GamepadHasButton(dev->gamepad, SDL_GamepadButton(src.code))) return std::nullopt;
         return SDL_GetGamepadButton(dev->gamepad, SDL_GamepadButton(src.code)) ? 1.0f : 0.0f;
     case InputSource::Kind::PadAxis:
-        if (!dev || !dev->gamepad || !SDL_GamepadHasAxis(dev->gamepad, SDL_GamepadAxis(src.code))) return std::nullopt;
+        if (!dev || !dev->gamepad) return std::nullopt;
+        if (pads_snapped_ && src.code >= 0 && src.code < SDL_GAMEPAD_AXIS_COUNT) {
+            if (!dev->pad_has_axis[src.code]) return std::nullopt;
+            return normalize_axis(dev->pad_axes[src.code]);
+        }
+        if (!SDL_GamepadHasAxis(dev->gamepad, SDL_GamepadAxis(src.code))) return std::nullopt;
         return normalize_axis(SDL_GetGamepadAxis(dev->gamepad, SDL_GamepadAxis(src.code)));
     case InputSource::Kind::JoyButton:
         if (!dev || src.code >= SDL_GetNumJoystickButtons(dev->joystick)) return std::nullopt;
@@ -902,7 +913,30 @@ void InputManager::evaluate_profile(const Player& p, const Device* dev, bool key
     for (size_t i = 0; i < kPadAxisCount; ++i) s.set_axis(static_cast<PadAxis>(i), axis_val[i]);
 }
 
+void InputManager::snapshot_pads() {
+    for (Device& d : devices_) {
+        if (!d.gamepad) continue;
+        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; ++b) {
+            const SDL_GamepadButton button = SDL_GamepadButton(b);
+            d.pad_buttons[b] = SDL_GamepadHasButton(d.gamepad, button) ? s8(SDL_GetGamepadButton(d.gamepad, button) ? 1 : 0)
+                                                                       : s8(-1);
+        }
+        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; ++a) {
+            const SDL_GamepadAxis axis = SDL_GamepadAxis(a);
+            d.pad_has_axis[a] = SDL_GamepadHasAxis(d.gamepad, axis);
+            d.pad_axes[a] = d.pad_has_axis[a] ? SDL_GetGamepadAxis(d.gamepad, axis) : Sint16(0);
+        }
+    }
+    pads_snapped_ = true;
+}
+
 void InputManager::update(double dt) {
+    // This frame's gamepads, read once (Device::pad_buttons); read live again after update().
+    snapshot_pads();
+    struct Unsnap {
+        bool& snapped;
+        ~Unsnap() { snapped = false; }
+    } unsnap{pads_snapped_};
     if (capturing_ && chord_capture_) {
         update_chord_capture();
     } else if (capturing_) {

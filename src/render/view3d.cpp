@@ -1,3 +1,4 @@
+#include "base/prof.h"
 #include "render/view3d.h"
 
 #include "base/file.h"
@@ -165,6 +166,7 @@ bool culled(const DrawItem& item, const Placed& m, const DrawOptions& opt, const
     if (item.background || item.helper) return false;
     const float max_dist = item.draw_distance >= 0 ? item.draw_distance : opt.draw_distance;
     if (max_dist > 0 && m.dist - m.radius > max_dist) return true;
+    if (opt.min_size > 0 && item.nodes && m.radius < opt.min_size * m.dist) return true; // (DrawOptions::min_size)
     const float far = item_far(item, opt);
     if (far > 0 && eye_depth(view, m.center) - m.radius > far) return true;
     if (opt.frustum_cull)
@@ -440,6 +442,7 @@ void View3D::release_target() {
 }
 
 bool View3D::ensure_target(SDL_Renderer* renderer, int w, int h) {
+    GT3R_PROF("v3d.ensure_target");
     if (w == width_ && h == height_ && samples_ == ctx_.msaa() && wrapper_) return true;
     release_target();
     SDL_GPUDevice* dev = ctx_.device();
@@ -511,6 +514,7 @@ bool View3D::ensure_half(SDL_Renderer* renderer) {
 
 void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& view, const Mat4& proj, const Vec3& eye,
                   const std::vector<DrawItem>& items, const DrawOptions& opt) {
+    GT3R_PROF("v3d.draw");
     // Logical (UI) rectangle -> physical pixels.
     float sx = 1, sy = 1;
     int lw = 0, lh = 0;
@@ -781,6 +785,7 @@ bool View3D::ensure_post(SDL_GPUTexture** t) {
 
 void View3D::copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_GPUTexture* to, int w, int h,
                           bool cycle) {
+    GT3R_PROF("v3d.copy_picture");
     SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureLocation src{}, dst{};
     src.texture = from, dst.texture = to;
@@ -794,6 +799,7 @@ void View3D::copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_G
 // blended at `alpha` (1: replaces).
 void View3D::encode_post(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, SDL_GPUTexture* picture, int picture_w,
                          int picture_h, float alpha, const DrawOptions::PostGrade* grade) {
+    GT3R_PROF("v3d.encode_post");
     if (picture_w <= 0 || picture_h <= 0) return;
     // The quad's texture coordinates span the whole texture: a viewport that many target-sizes
     // across puts the picture's corner over this frame's (the whole target when the sizes match);
@@ -849,6 +855,7 @@ void View3D::encode_post(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, SDL
 
 View3D::ScreenUpload View3D::upload_screen(SDL_GPUCommandBuffer* cmd, const DrawOptions& o, int picture_w,
                                            int picture_h) {
+    GT3R_PROF("v3d.upload_screen");
     ScreenUpload up;
     const ScreenBatch* batches[3] = {o.haze, o.overlay, o.vignette};
     u32* firsts[3] = {&up.haze, &up.overlay, &up.vignette};
@@ -887,6 +894,7 @@ View3D::ScreenUpload View3D::upload_screen(SDL_GPUCommandBuffer* cmd, const Draw
 
 bool View3D::upload_clipped(SDL_GPUCommandBuffer* cmd, const Mat4& view, const Mat4& proj, const Vec3& eye,
                             const std::vector<DrawItem>& items, const DrawOptions& opt) {
+    GT3R_PROF("v3d.upload_clipped");
     clipped_.clear();
     const Mat4 view_proj = proj * view;
     float planes[6][4];
@@ -987,6 +995,7 @@ bool View3D::upload_clipped(SDL_GPUCommandBuffer* cmd, const Mat4& view, const M
 
 void View3D::encode_screen(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const ScreenBatch& b, u32 first_index,
                            bool frame) {
+    GT3R_PROF("v3d.encode_screen");
     if (b.empty() || !screen_.vb || !screen_.ib) return;
     const SDL_GPUViewport vp{0, 0, float(used_w_), float(used_h_), 0, 1};
     const SDL_Rect sc{0, 0, used_w_, used_h_};
@@ -1046,6 +1055,7 @@ void View3D::encode_screen(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, c
 void View3D::encode_after_scene(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Mat4& view, const Mat4& proj,
                                 const Vec3& eye, const std::vector<DrawItem>& items, const DrawOptions& o,
                                 const ScreenUpload& up) {
+    GT3R_PROF("v3d.after_scene");
     const SDL_GPUViewport vp{0, 0, float(used_w_), float(used_h_), 0, 1};
     const SDL_Rect sc{0, 0, used_w_, used_h_};
     SDL_SetGPUViewport(pass, &vp);
@@ -1192,6 +1202,7 @@ void View3D::encode_resample(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass,
 // the turn sweeps (any copy), at their coverage; without it, the whole rectangle (the body too).
 void View3D::spin_resolve(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* picture, int pw, int ph, bool cycle,
                           bool masked) {
+    GT3R_PROF("v3d.spin_resolve");
     const int samples = ctx_.gles() ? 1 : ctx_.msaa(); // (the OpenGL ES variant has no sample masks)
     auto weight_of = [&](const SpinRect& s) { return s.period < 2 ? 0.0f : std::min(s.spread_px / float(samples), 1.0f); };
     if (!ensure_post(&haze_src_) || !ensure_quad()) return;
@@ -1239,6 +1250,7 @@ bool View3D::spin_filter_wanted() const {
 
 bool View3D::encode_spin_mask(SDL_GPUCommandBuffer* cmd, const Mat4& view, const Mat4& proj, const Vec3& eye,
                               const std::vector<DrawItem>& items, const DrawOptions& o, int pw, int ph) {
+    GT3R_PROF("v3d.spin_mask");
     if (!ensure_post(&spin_mask_)) return false;
     SDL_GPUColorTargetInfo ct{};
     ct.clear_color = {1, 1, 1, 1};
@@ -1278,6 +1290,7 @@ bool View3D::encode_spin_mask(SDL_GPUCommandBuffer* cmd, const Mat4& view, const
 // half a pixel right and down). Ours keeps those offsets; its texel centres sit at +0.5.
 void View3D::encode_dof(SDL_GPUCommandBuffer* cmd, const DrawOptions& o, const Mat4& proj, float aspect,
                         SDL_GPUTexture* out, bool cycle) {
+    GT3R_PROF("v3d.encode_dof");
     const int pw = used_w_, ph = used_h_;
     const float W = float(width_), H = float(height_);
     // The picture's texels in scene_ (the target's corner), clamped half a texel in.
@@ -1482,6 +1495,7 @@ bool View3D::draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, con
 
 void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Mat4& view, const Mat4& proj,
                     const Vec3& eye, const std::vector<DrawItem>& items, const DrawOptions& opt, Items which) {
+    GT3R_PROF("v3d.encode");
     const Mat4 view_proj = proj * view;
     // Wireframe lines are pulled slightly towards the camera (to a larger depth) to avoid z-fighting.
     Mat4 line_proj = proj;
@@ -1594,6 +1608,7 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
     // uniforms, textures) and the next primitive's indices continue its own in the same mesh,
     // the two are one draw. State is only set when it differs from what the pass has, and any
     // change sends the waiting draw first.
+    GT3R_PROF("v3d.encode.draws"); // (the rest of encode; the visibility above is the difference)
     struct PendingDraw {
         u32 first = 0, count = 0;
         s32 vertex_offset = 0;
@@ -1606,8 +1621,14 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
         pending.count = 0;
     };
     SDL_GPUGraphicsPipeline* bound = nullptr;
+    // The last key's pipeline: neighbouring primitives mostly share one, and GpuContext::pipeline
+    // locks a mutex and searches a map.
+    PipelineKey last_key{};
+    SDL_GPUGraphicsPipeline* last_pipeline = nullptr;
+    bool have_last = false;
     auto bind = [&](const PipelineKey& key) {
-        SDL_GPUGraphicsPipeline* p = ctx_.pipeline(key);
+        if (!have_last || !(key == last_key)) last_pipeline = ctx_.pipeline(key), last_key = key, have_last = true;
+        SDL_GPUGraphicsPipeline* p = last_pipeline;
         if (p && p != bound) flush(), SDL_BindGPUGraphicsPipeline(pass, p);
         if (p) bound = p;
         return p != nullptr;
@@ -2152,6 +2173,42 @@ SDL_GPUTexture* View3D::placeholder_cube() {
     ti.layer_count_or_depth = 6;
     ti.num_levels = 1;
     ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+#if defined(__vita__)
+    // The Vita: the six grey texels uploaded instead of cleared in six render passes. Each pass
+    // left a frame buffer, with a render target of its own in vitaGL, for as long as the view
+    // lived (six a view: race, mirror, every menu model's), and the GPU ran out of render targets
+    // (SCE_GXM_ERROR_OUT_OF_RENDER_TARGETS: a crash at a race's end, a blank dealership after).
+    ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    placeholder_cube_ = SDL_CreateGPUTexture(dev, &ti);
+    if (!placeholder_cube_) return nullptr;
+    SDL_GPUTransferBufferCreateInfo bi{};
+    bi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    bi.size = 6 * 4;
+    if (SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev, &bi)) {
+        if (auto* p = static_cast<u8*>(SDL_MapGPUTransferBuffer(dev, tb, false))) {
+            for (u32 i = 0; i < 6 * 4; ++i) p[i] = (i % 4) == 3 ? 255 : 128; // (the clear's 0.5 grey, opaque)
+            SDL_UnmapGPUTransferBuffer(dev, tb);
+            if (SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev)) {
+                SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+                for (u32 f = 0; f < 6; ++f) {
+                    SDL_GPUTextureTransferInfo src{};
+                    src.transfer_buffer = tb;
+                    src.offset = f * 4;
+                    src.pixels_per_row = src.rows_per_layer = 1;
+                    SDL_GPUTextureRegion dst{};
+                    dst.texture = placeholder_cube_;
+                    dst.layer = f;
+                    dst.w = dst.h = dst.d = 1;
+                    SDL_UploadToGPUTexture(cp, &src, &dst, false);
+                }
+                SDL_EndGPUCopyPass(cp);
+                SDL_SubmitGPUCommandBuffer(cmd);
+            }
+        }
+        SDL_ReleaseGPUTransferBuffer(dev, tb);
+    }
+    return placeholder_cube_;
+#endif
     placeholder_cube_ = SDL_CreateGPUTexture(dev, &ti);
     if (!placeholder_cube_) return nullptr;
     if (SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev)) {

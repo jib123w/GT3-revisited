@@ -164,7 +164,16 @@ void raw_close() {
 }
 #endif
 
-// Lines wait here until a warning, an error, a second's time or a full buffer writes them.
+// Lines wait here until a warning, an error, a second's time or a full buffer writes them. PlayStation
+// Vita: a write to the memory card takes tens of milliseconds (the race log's 3 s lines cost ~1 ms a
+// frame), so every 5 s and at once only for errors.
+#if defined(__vita__)
+constexpr Uint64 kFlushMs = 5000;
+constexpr LogLevel kWriteAtOnce = LogLevel::Error;
+#else
+constexpr Uint64 kFlushMs = 1000;
+constexpr LogLevel kWriteAtOnce = LogLevel::Warn;
+#endif
 char g_buf[16 * 1024];
 std::atomic<size_t> g_len{0};
 Uint64 g_last_flush = 0;
@@ -194,7 +203,7 @@ void append_locked(std::string_view s, bool now) {
     const size_t at = g_len.load();
     std::memcpy(g_buf + at, s.data(), s.size());
     g_len = at + s.size();
-    if (now || SDL_GetTicks() - g_last_flush >= 1000) flush_locked();
+    if (now || SDL_GetTicks() - g_last_flush >= kFlushMs) flush_locked();
 }
 
 LogLevel level_of(SDL_LogPriority p) {
@@ -219,7 +228,7 @@ void SDLCALL output(void* userdata, int category, SDL_LogPriority priority, cons
     const std::string text = g_redactor.apply(message);
     const std::string line = format_line(double(SDL_GetTicksNS()) / 1e9, level, text);
     const std::string out = g_limiter.feed(level, text, line);
-    if (!out.empty()) append_locked(out, level >= LogLevel::Warn);
+    if (!out.empty()) append_locked(out, level >= kWriteAtOnce);
 }
 
 // The home folder and, on computers, the account name (its last part). Phones, tablets and

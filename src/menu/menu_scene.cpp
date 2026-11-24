@@ -10,27 +10,49 @@ namespace gt3r::menu {
 
 const char* const kMenuLanguages[] = {"US", "JP", "BR", "FR", "GR", "IT", "SP", nullptr};
 
+bool MenuScene::decode_image(const PmbFile& file, ByteSpan data, size_t i, MenuImage& out, const std::string& path) {
+    try {
+        Bytes tex = file.image_data(data, i);
+        Tex1 set = Tex1::parse(tex);
+        if (set.textures.empty()) throw FormatError("empty Tex1 set");
+        GsMemory gs;
+        set.upload(tex, gs);
+        Tex1::Image img = set.decode(gs, 0);
+        texture_pack::replace_decoded(tex, 0, img); // the elements' UVs address a pack's picture the same way
+        out = {img.width, img.height, std::move(img.rgba)};
+        return true;
+    } catch (const std::exception& e) {
+        LOG_WARN("%s: image %zu: %s", path.c_str(), i, e.what());
+        return false;
+    }
+}
+
 MenuScene MenuScene::load(ByteSpan data, std::string path) {
     MenuScene s;
     s.path_ = std::move(path);
     s.file_ = PmbFile::parse(data);
     s.images_.resize(s.file_.images.size());
-    for (size_t i = 0; i < s.file_.images.size(); ++i) {
-        try {
-            Bytes tex = s.file_.image_data(data, i);
-            Tex1 set = Tex1::parse(tex);
-            if (set.textures.empty()) throw FormatError("empty Tex1 set");
-            GsMemory gs;
-            set.upload(tex, gs);
-            Tex1::Image img = set.decode(gs, 0);
-            texture_pack::replace_decoded(tex, 0, img); // the elements' UVs address a pack's picture the same way
-            s.images_[i] = {img.width, img.height, std::move(img.rgba)};
-        } catch (const std::exception& e) {
-            ++s.image_failures_;
-            LOG_WARN("%s: image %zu: %s", s.path_.c_str(), i, e.what());
-        }
-    }
+    for (size_t i = 0; i < s.file_.images.size(); ++i)
+        if (!decode_image(s.file_, data, i, s.images_[i], s.path_)) ++s.image_failures_;
     return s;
+}
+
+void MenuScene::drop_pixels() const {
+    if (!source_ || pixels_dropped_) return;
+    // The pmb's own images only (those patches added stay: they cannot be decoded again).
+    for (size_t i = 0; i < file_.images.size() && i < images_.size(); ++i) std::vector<u32>().swap(images_[i].rgba);
+    pixels_dropped_ = true;
+}
+
+void MenuScene::ensure_pixels() const {
+    if (!pixels_dropped_) return;
+    pixels_dropped_ = false;
+    std::optional<std::vector<u8>> data = source_ ? source_() : std::nullopt;
+    if (!data) {
+        LOG_WARN("%s: cannot read it again for its images", path_.c_str());
+        return;
+    }
+    for (size_t i = 0; i < file_.images.size() && i < images_.size(); ++i) decode_image(file_, *data, i, images_[i], path_);
 }
 
 MenuScene MenuScene::load(const Vfs& vfs, const std::string& path) {

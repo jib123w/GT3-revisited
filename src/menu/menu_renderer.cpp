@@ -118,6 +118,12 @@ std::vector<SDL_Texture*> MenuRenderer::upload(const MenuScene* scene) {
         }
         out.push_back(t);
     }
+#if defined(__vita__)
+    // On the GPU now: the scene's decoded pixels go (a menu set's scenes, which can decode them
+    // again: MenuScene::drop_pixels). Every GT Mode page stays loaded, and their pixels filled the
+    // Vita's heap.
+    scene->drop_pixels();
+#endif
     return out;
 }
 

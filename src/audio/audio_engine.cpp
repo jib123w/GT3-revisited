@@ -1,3 +1,4 @@
+#include "base/prof.h"
 #include "audio/audio_engine.h"
 
 #include "audio/music_file.h"
@@ -5,7 +6,13 @@
 #include "base/log.h"
 #include "vfs/vfs.h"
 
+#if defined(__vita__)
+#include <psp2/kernel/cpu.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -156,6 +163,7 @@ bool AudioEngine::use_device(SDL_AudioDeviceID phys) {
     }
     if (old_music) SDL_CloseAudioDevice(old_music);
     if (old_voices) SDL_CloseAudioDevice(old_voices);
+    device_latency_s_.store(-1.0, std::memory_order_relaxed); // (asked again of the new device)
     const char* name = SDL_GetAudioDeviceName(phys);
     LOG_INFO("Audio output: %s%s", phys == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK ? "system default, " : "",
              name ? name : "?");
@@ -336,13 +344,28 @@ void AudioEngine::set_sfx_volume(float v) {
     voices_.set_bus_gain(VoiceBus::Effects, sfx_volume_);
 }
 
+#if defined(__vita__)
+// PlayStation Vita: SDL's audio thread (it runs these callbacks) on the second user core, away
+// from the main thread's (src/app/vita_process.cpp), once.
+static void pin_audio_thread() {
+    static std::atomic<SceUID> pinned{-1};
+    const SceUID me = sceKernelGetThreadId();
+    if (pinned.exchange(me) != me) sceKernelChangeThreadCpuAffinityMask(me, SCE_KERNEL_CPU_MASK_USER_1);
+}
+#endif
+
 void SDLCALL AudioEngine::feed_voices(void* user, SDL_AudioStream* stream, int additional, int) {
+    GT3R_PROF_AUDIO();
+#if defined(__vita__)
+    pin_audio_thread();
+#endif
     auto* self = static_cast<AudioEngine*>(user);
     if (additional <= 0) return;
     // Render in small blocks so parameter changes land with low latency.
     size_t frames = size_t(additional) / 4;
     if (frames == 0) frames = 1;
-    std::vector<s16> buf(frames * 2);
+    std::vector<s16>& buf = self->voice_buf_; // (kept: no allocation on the audio thread each call)
+    buf.resize(frames * 2);
     self->voices_.mix(buf.data(), frames);
     SDL_PutAudioStreamData(stream, buf.data(), int(buf.size() * sizeof(s16)));
 }
@@ -413,6 +436,8 @@ void AudioEngine::start_stream(std::unique_ptr<MusicStream> stream, std::shared_
         music_ = std::move(stream);
         music_data_ = std::move(data);
         music_finished_ = false;
+        music_live_.store(true);
+        fed_at_ns_.store(0, std::memory_order_release); // (the new piece: nothing fed yet)
         stream_level_ = volume;
         stream_trim_ = trim;
     }
@@ -441,6 +466,8 @@ void AudioEngine::stop_stream() {
         std::lock_guard lock(mutex_);
         music_.reset();
         music_data_.reset();
+        fed_at_ns_.store(0, std::memory_order_release);
+        music_live_.store(false);
         if (music_stream_) SDL_ClearAudioStream(music_stream_);
     }
     if (music_stream_) {
@@ -467,8 +494,7 @@ void AudioEngine::resume_music() {
 
 bool AudioEngine::music_playing() const {
     if (sequencer_.active()) return true;
-    std::lock_guard lock(mutex_);
-    return music_ && !music_finished_;
+    return music_live_.load(); // (no mutex_: feed() holds it while it decodes)
 }
 
 double AudioEngine::music_position() const {
@@ -479,27 +505,29 @@ double AudioEngine::music_position() const {
 
 double AudioEngine::music_audible_position() const {
     if (sequencer_.active() || !music_stream_) return music_position();
-    double pos = 0, rate = 0;
-    u32 ch = 0;
-    {
-        std::lock_guard lock(mutex_);
-        if (!music_) return 0.0;
-        pos = music_->position_seconds();
-        rate = music_->sample_rate();
-        ch = music_->channels();
+    // The decoded position less the stream's queue, as feed() left them, then the time played
+    // since (never past what was decoded: a paused device stops there), less the device's buffer.
+    const Uint64 at = fed_at_ns_.load(std::memory_order_acquire);
+    if (at == 0) return 0.0;
+    double latency = device_latency_s_.load(std::memory_order_relaxed);
+    if (latency < 0) {
+        SDL_AudioSpec spec{};
+        int frames = 0;
+        latency = 0;
+        if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(music_stream_), &spec, &frames) && frames > 0 && spec.freq > 0)
+            latency = double(frames) / spec.freq;
+        device_latency_s_.store(latency, std::memory_order_relaxed);
     }
-    if (rate <= 0 || ch == 0) return pos;
-    // Queued input (S16 at the stream's rate), then the device's own buffer.
-    const int queued = SDL_GetAudioStreamQueued(music_stream_);
-    if (queued > 0) pos -= double(queued) / (2.0 * ch * rate);
-    SDL_AudioSpec spec{};
-    int frames = 0;
-    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(music_stream_), &spec, &frames) && frames > 0 && spec.freq > 0)
-        pos -= double(frames) / spec.freq;
+    const double since = double(SDL_GetTicksNS() - at) / 1e9;
+    const double pos = std::min(fed_unqueued_.load(std::memory_order_relaxed) + since,
+                                fed_decoded_.load(std::memory_order_relaxed)) - latency;
     return std::max(pos, 0.0);
 }
 
 void AudioEngine::set_stream_level(float level) {
+    // The race asks every frame: no mutex_ when nothing changes (only this thread writes
+    // stream_level_; the audio thread never reads it).
+    if (stream_level_ == level) return;
     float trim;
     {
         std::lock_guard lock(mutex_);
@@ -541,19 +569,36 @@ void AudioEngine::set_music_volume(float v) {
 }
 
 void SDLCALL AudioEngine::feed(void* user, SDL_AudioStream* stream, int additional, int) {
+    GT3R_PROF_AUDIO();
+#if defined(__vita__)
+    pin_audio_thread();
+#endif
     auto* self = static_cast<AudioEngine*>(user);
     std::lock_guard lock(self->mutex_);
     if (!self->music_ || self->music_finished_ || additional <= 0) return;
     const u32 ch = self->music_->channels();
     size_t frames = size_t(additional) / (2 * ch) + 1;
-    std::vector<s16> buf(frames * ch);
+    std::vector<s16>& buf = self->music_buf_;
+    buf.resize(frames * ch);
     try {
         size_t got = self->music_->read(buf.data(), frames);
-        if (got == 0) self->music_finished_ = true;
-        else SDL_PutAudioStreamData(stream, buf.data(), int(got * ch * sizeof(s16)));
+        if (got == 0) {
+            self->music_finished_ = true;
+            self->music_live_.store(false);
+        } else {
+            SDL_PutAudioStreamData(stream, buf.data(), int(got * ch * sizeof(s16)));
+            // For music_audible_position (this thread holds the stream's lock: the queue is ours to read).
+            const double rate = self->music_->sample_rate(), decoded = self->music_->position_seconds();
+            const int queued = SDL_GetAudioStreamQueued(stream);
+            self->fed_decoded_.store(decoded, std::memory_order_relaxed);
+            self->fed_unqueued_.store(decoded - (queued > 0 && rate > 0 ? double(queued) / (2.0 * ch * rate) : 0.0),
+                                      std::memory_order_relaxed);
+            self->fed_at_ns_.store(SDL_GetTicksNS(), std::memory_order_release);
+        }
     } catch (const std::exception& ex) {
         LOG_ERROR("Music stream error: %s", ex.what());
         self->music_finished_ = true;
+        self->music_live_.store(false);
     }
 }
 

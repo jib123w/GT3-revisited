@@ -5,6 +5,7 @@
 // defines them). The race screen code map is in docs/dev/RACE.md; the public entry points
 // are in screen_race.h and screen_online.h.
 
+#include "base/prof.h"
 #include "app/app.h"
 #include "app/camera_editor.h"
 #include "app/screen_gtmode.h"
@@ -830,6 +831,11 @@ private:
     mutable std::deque<WheelTrack> wheel_tracks_;
     WheelTrack ghost_wheel_track_;
     bool env_cube_on_ = true; // [video] car_reflections
+    float draw_share_ = 1.0f; // [video] draw_distance / 100: the scenery beyond that share of the far plane left out
+    bool host_math_ = false; // [race] physics = fast (PlayStation Vita: ee::HostMathScope around the vehicle step)
+    bool mirror_on_ = true; // [video] rear_mirror
+    bool grading_on_ = true; // [video] color_grading (RaceScreen::apply_post_pass)
+    void read_live_settings(App& app); // (screen_race_setup.cpp)
     bool shadows_on_ = true;  // [video] car_shadows
     bool full_car_detail_ = false; // [video] full_car_detail (CarVisual::set_full_detail)
     bool showroom_wheels_ = false; // [video] showroom_wheels (read_showroom)
@@ -1039,6 +1045,10 @@ private:
     std::unique_ptr<RaceField> field_;
     std::unique_ptr<RaceField> solo_field_; // a solo run on the exact core (exact_solo)
     std::vector<std::shared_ptr<CarVisual>> opp_visuals_;
+    // The opponents' models by model (a mod car's base) and paint, kept while the screen lives: the next field reuses them
+    // (load_opponent_cars).
+    using OpponentModelKey = std::pair<std::string, int>;
+    std::map<OpponentModelKey, std::shared_ptr<CarVisual>> opp_models_;
     bool race_mode_ = false;
     // --- online battle (docs/dev/ONLINE.md) ---
     bool online_ = false;
@@ -1181,14 +1191,33 @@ private:
         if (course_scene_) course_scene_->restart_animations(countdown);
         wet_.clut_animations().restart(countdown);
         billboards_.clut_animations().restart(countdown);
+        animation_pending_ = 0;
     }
+    // [video] scenery_animation = reduced: the animations advance only in steps of
+    // kReducedAnimationStep (the time between kept, so they stay on time: the start lights
+    // change on the second), and each step's recoloured textures and moved scenery go up once,
+    // not every frame (on the Vita those uploads took 20 ms a frame).
+    static constexpr float kReducedAnimationStep = 1.0f / 6.0f;
+    bool reduced_animation_ = false;
+    float animation_pending_ = 0;
     void animate_course(float seconds) {
+        if (reduced_animation_) {
+            animation_pending_ += seconds;
+            if (animation_pending_ < kReducedAnimationStep) return;
+            seconds = animation_pending_;
+            animation_pending_ = 0;
+        }
         if (course_scene_) course_scene_->animate(seconds);
         wet_.clut_animations().animate(seconds);
         billboards_.clut_animations().animate(seconds);
     }
     void upload_course_animations() {
-        if (course_scene_) course_scene_->upload_animations();
+        GT3R_PROF("race.upload_animations");
+        if (course_scene_) {
+            GT3R_PROF("race.upload_animations.course");
+            course_scene_->upload_animations();
+        }
+        GT3R_PROF("race.upload_animations.wet_billboards");
         wet_.clut_animations().upload();
         billboards_.clut_animations().upload();
     }

@@ -107,6 +107,26 @@ public:
     // runs at 60 Hz); steadier when the computer is busy. Off (default): every display refresh.
     bool limit_60fps() const;
     void set_limit_60fps(bool on);
+    // [video] fps_lock = off | 60 | 30 | 20 (default off): at most that many frames a second, on a
+    // whole number of display refreshes (30 on a 60 Hz screen: every second refresh), as SDL's main
+    // loop rate (App::apply_frame_limit). Unset, limit_60fps = on reads as 60. Steadier than a
+    // frame rate that wanders above it.
+    int fps_lock() const;
+    void set_fps_lock(int fps);
+    // Applies fps_lock to SDL's main loop rate (again after a vsync or display change).
+    void apply_frame_limit();
+    // The effective value of a [video] setting the performance profiles change: the config's, or
+    // the platform default (platform::low_power and the Vita's own: App::video_default).
+    std::string video_setting(const char* key) const;
+    // [video] performance profiles: named sets of the graphics settings (App::kPerformanceProfiles).
+    // performance_profile(): the profile whose values all match the current ones, -1 when none
+    // does (Custom). set_performance_profile writes the profile's settings (the race reads them when
+    // it starts; the 3D resolution changes at once).
+    static int performance_profile_count();
+    static const char* performance_profile_name(int i);
+    static const char* performance_profile_desc(int i);
+    int performance_profile() const;
+    void set_performance_profile(int i);
     // [video] show_fps = on | off (default off): the frame rate in a corner of the screen, over
     // every screen (App::draw_fps).
     bool show_fps() const { return show_fps_; }
@@ -304,6 +324,17 @@ private:
     Uint64 mouse_used_ns_ = 0;
     bool cursor_hidden_ = false;
     void idle_cursor(Uint64 now);
+#if defined(SDL_PLATFORM_VITA)
+    // The touch screen's Settings tab (docs/dev/VITA.md): a touch anywhere shows it in the top
+    // right corner for a few seconds, a tap on it opens Settings (App::vita_tab_event).
+    bool vita_tab_event(const SDL_Event& local);
+    void vita_tab_render();
+    UiRect vita_tab_rect() const;
+    bool vita_settings_open() const;
+    Uint64 vita_tab_until_ns_ = 0;  // shown until then
+    bool vita_tab_held_ = false;     // the finger that tapped it is still down: its events are ours
+    const Screen* vita_settings_ = nullptr; // the Settings the tab opened (compared, never used)
+#endif
 
     SDL_Mutex* dialog_mutex_ = nullptr;
     std::string dialog_result_;
@@ -324,7 +355,6 @@ private:
     static double dyn_cycle_s();
     // The main loop rate set by App::apply_frame_limit (0: as fast as vsync allows).
     double frame_limit_rate_ = 0;
-    void apply_frame_limit();
     // [video] gamma, and its pass while it is not 1 (destroyed before gpu_).
     float gamma_ = 1.0f;
     std::unique_ptr<render::GammaPass> gamma_pass_;
@@ -353,7 +383,11 @@ std::unique_ptr<Screen> make_new_livery_screen(); // a livery template for a car
 // `to_game`: opened from the game's menus, which it returns to ("Back to game").
 std::unique_ptr<Screen> make_settings_screen(int tab = 0, bool to_game = false);
 constexpr int kSettingsTabControls = 2;
+#if defined(__vita__)
+constexpr int kSettingsTabDisc = 4; // (the Vita has no feedback and touch pages before it)
+#else
 constexpr int kSettingsTabDisc = 6;
+#endif
 // Settings -> Touch -> Customize layout: move, resize and hide the on-screen controls. `to_game`:
 // Settings was opened from the game's menus (make_settings_screen's to_game); Triangle then closes
 // this and Settings at once, back to the game (the screen pops itself, then calls it).

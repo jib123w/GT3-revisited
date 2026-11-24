@@ -655,6 +655,11 @@ void TouchControls::set_fade(bool on) {
 }
 
 bool TouchControls::visible() const {
+#if defined(__vita__)
+    // The Vita has its buttons: no on-screen controls, whatever [touch] mode says. A touch goes to
+    // the screen underneath (taps on menus), and the corner tab opens Settings (app/app.cpp).
+    return false;
+#endif
     if (layout_ == TouchLayout::None || cfg_.mode == TouchConfig::Mode::Off) return false;
     return cfg_.mode == TouchConfig::Mode::On || touch_active_;
 }

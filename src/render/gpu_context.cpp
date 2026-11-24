@@ -13,12 +13,16 @@
 #include "render/shaders/generated/model_vert.h"
 #include "render/shaders/generated/model_vert_copy.h"
 #include "render/shaders/generated/no_color_frag.h"
+#if GT3R_VITA
+#include "render/shaders/vita_cg.h"
+#endif
 #include "scene/model.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #ifdef __ANDROID__
 #include <sys/prctl.h>
 #endif
@@ -233,11 +237,38 @@ SDL_GPUShader* GpuContext::make_shader(Stage stage) {
                                        GT3R_SHADER_CODE(model_frag_filter), GT3R_SHADER_CODE(model_frag_resample),
                                        GT3R_SHADER_CODE(model_frag_fx),    GT3R_SHADER_CODE(model_vert_copy),
                                        GT3R_SHADER_CODE(model_frag_copy),  GT3R_SHADER_CODE(no_color_frag)};
-    if (stage == Stage::NoColorFragment) return create_shader(kCode[size_t(stage)], false, 0, 0);
+    const ShaderCode* code = &kCode[size_t(stage)];
+#if GT3R_VITA
+    // The Vita: the Cg shaders (render/shaders/vita_cg.h, docs/dev/VITA.md). The stages it has no
+    // Cg for take the nearest it has: the GS filter the plain one, the wheel blurs and the rim
+    // copies the full one.
+    namespace v = shaders::vita;
+    static const std::string clip_vert = std::string("#define CLIPPED 1\n") + v::model_vert;
+    static const std::string plain_frag = std::string("#define PLAIN 1\n") + v::model_frag;
+    static const std::string resample_frag = std::string("#define RESAMPLE 1\n") + v::model_frag;
+    const auto vita = [](const char* src, const char* blocks, const char* samplers, const char* attributes) {
+        return ShaderCode{nullptr, 0, nullptr, src, blocks, samplers, attributes};
+    };
+    static const ShaderCode kVita[] = {
+        vita(v::model_vert, v::vertex_blocks, "", v::vertex_attributes),                // Vertex
+        vita(clip_vert.c_str(), v::vertex_blocks, "", v::clipped_attributes),          // ClippedVertex
+        vita(v::model_frag, v::fragment_blocks, v::fragment_samplers, nullptr),         // Fragment
+        vita(plain_frag.c_str(), v::fragment_blocks, v::fragment_samplers, nullptr),    // PlainFragment
+        vita(plain_frag.c_str(), v::fragment_blocks, v::fragment_samplers, nullptr),    // FilterFragment
+        vita(resample_frag.c_str(), v::fragment_blocks, v::fragment_samplers, nullptr), // ResampleFragment
+        vita(v::model_frag, v::fragment_blocks, v::fragment_samplers, nullptr),         // FxFragment
+        vita(v::model_vert, v::vertex_blocks, "", v::vertex_attributes),                // CopyVertex
+        vita(v::model_frag, v::fragment_blocks, v::fragment_samplers, nullptr),         // CopyFragment
+        vita(v::no_color_frag, "", "", nullptr),                                         // NoColorFragment
+    };
+    static_assert(sizeof(kVita) / sizeof(kVita[0]) == sizeof(kCode) / sizeof(kCode[0]));
+    code = &kVita[size_t(stage)];
+#endif
+    if (stage == Stage::NoColorFragment) return create_shader(*code, false, 0, 0);
     const bool vertex = stage == Stage::Vertex || stage == Stage::ClippedVertex || stage == Stage::CopyVertex;
     // Vertex: transforms, GT3 per-vertex lighting. Fragment: the texture, the environment cube,
     // the sphere map.
-    return create_shader(kCode[size_t(stage)], vertex, vertex ? 0 : 3, vertex ? 2 : 1);
+    return create_shader(*code, vertex, vertex ? 0 : 3, vertex ? 2 : 1);
 }
 
 SDL_GPUShader* GpuContext::create_shader(const ShaderCode& code, bool vertex, Uint32 samplers,
@@ -251,6 +282,7 @@ SDL_GPUShader* GpuContext::create_shader(const ShaderCode& code, bool vertex, Ui
         props = SDL_CreateProperties();
         SDL_SetStringProperty(props, GT3R_GL_PROP_SHADER_UNIFORM_BLOCKS, code.gles_blocks);
         SDL_SetStringProperty(props, GT3R_GL_PROP_SHADER_SAMPLERS, code.gles_samplers);
+        if (code.gles_attributes) SDL_SetStringProperty(props, GT3R_GL_PROP_SHADER_ATTRIBUTES, code.gles_attributes);
         info.props = props;
         info.format = SDL_GPU_SHADERFORMAT_PRIVATE;
         info.code = reinterpret_cast<const Uint8*>(code.gles);
@@ -896,6 +928,13 @@ SDL_GPUTexture* Uploader::texture_rgba(u32 w, u32 h, const u32* rgba, bool mipma
 void Uploader::update_rgba(SDL_GPUTexture* tex, u32 w, u32 h, const u32* rgba, bool mipmaps, bool cycle) {
     pending_.push_back({nullptr, tex, stage(rgba, w * h * 4), w * h * 4, w, h, 0, cycle});
     if (!mipmaps) return;
+#if defined(__vita__)
+    // The levels made by the GPU after the upload (submit: SDL_GenerateMipmapsForGPUTexture; vitaGL
+    // downscales with the GPU's transfer unit) instead of halved here and uploaded one by one: the
+    // course's recoloured textures (race::ClutAnimations) went through the CPU several times over.
+    gpu_mips_.push_back(tex);
+    return;
+#endif
     std::vector<u32> level;
     const u32* above = rgba;
     for (u32 i = 1, n = mip_levels(w, h); i < n; ++i) {
@@ -940,12 +979,14 @@ bool Uploader::submit() {
                 }
             }
             SDL_EndGPUCopyPass(copy);
+            for (SDL_GPUTexture* tex : gpu_mips_) SDL_GenerateMipmapsForGPUTexture(cmd, tex); // (update_rgba)
             ok = SDL_SubmitGPUCommandBuffer(cmd);
         }
     }
     if (t) SDL_ReleaseGPUTransferBuffer(device_, t); // deferred until the GPU is done
     if (ok) note_gpu_submits(device_, 1, staging_.size());
     pending_.clear();
+    gpu_mips_.clear();
     staging_ = {};
     return ok;
 }

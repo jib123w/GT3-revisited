@@ -388,7 +388,7 @@ private:
         for (const game::CarGetScene::Car& c : sc.cars) keys.push_back(c.car + "#" + std::to_string(c.paint) + "#");
         size_t missing = 0;
         for (const std::string& k : keys) missing += cars_.count(k) ? 0 : 1;
-        const size_t cap = std::max<size_t>(platform::is_mobile() ? 3u : 13u, keys.size() + 1);
+        const size_t cap = std::max<size_t>(platform::low_power() ? 3u : 13u, keys.size() + 1);
         if (cars_.size() + missing > cap) cars_.clear();
         std::vector<const Loaded*> models;
         for (const game::CarGetScene::Car& c : sc.cars) models.push_back(this->car(app, c.car, c.paint, std::string(), cap));
@@ -713,7 +713,7 @@ private:
         std::string key = car + "#" + std::to_string(paint) + "#" + wheel;
         if (auto it = cars_.find(key); it != cars_.end()) return it->second.model ? &it->second : nullptr;
         // Phones keep fewer of the detailed menu cars (Mali drivers spend ~185 KB per texture).
-        if (cars_.size() >= std::max<size_t>(cap, platform::is_mobile() ? 3u : 13u)) cars_.clear();
+        if (cars_.size() >= std::max<size_t>(cap, platform::low_power() ? 3u : 13u)) cars_.clear(); // (the Vita too: its heap)
         Loaded& l = cars_[key];
         const game::GtModeSession* s = game::gt_mode_session();
         if (!s) return nullptr;

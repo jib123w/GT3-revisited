@@ -3,6 +3,8 @@
 #include "base/log.h"
 #include "vfs/vfs.h"
 
+#include <new>
+
 namespace gt3r::menu::flow {
 
 FileReader vfs_reader(const Vfs& vfs) {
@@ -34,6 +36,13 @@ const MenuScene* MenuSet::scene(int n) const {
         if (auto data = reader_(path)) s = std::make_unique<MenuScene>(MenuScene::load(*data, path));
         else LOG_WARN("menu: cannot load [%s]", path.c_str());
         if (s && menu_patches().layout) menu_patches().layout(name_, n, reader_, *s);
+        // Its images can be decoded again from the file (MenuScene::drop_pixels, the Vita).
+        if (s) s->set_source([reader = reader_, path] { return reader(path); });
+    } catch (const std::bad_alloc&) {
+        // Out of memory: not remembered as a scene that cannot load (it is tried again next time;
+        // a failure kept here left GT Mode's pages broken for the rest of the session on the Vita).
+        LOG_WARN("menu: %s: out of memory", path.c_str());
+        return nullptr;
     } catch (const std::exception& e) {
         LOG_WARN("menu: %s: %s", path.c_str(), e.what());
     }

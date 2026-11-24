@@ -8,6 +8,8 @@
 #include "formats/menu/pmb.h"
 #include "formats/tex1.h"
 
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,7 +50,18 @@ public:
 
     const std::string& path() const { return path_; }
     const PmbFile& file() const { return file_; }
-    const std::vector<MenuImage>& images() const { return images_; }
+    // The decoded images (decoded again first if drop_pixels let them go).
+    const std::vector<MenuImage>& images() const {
+        ensure_pixels();
+        return images_;
+    }
+    // Where the pmb can be read again (a menu set's scenes: MenuSet::scene). With one, drop_pixels
+    // lets the decoded images' pixels go (their sizes stay) once a renderer has them on the GPU,
+    // and images() decodes them again when asked. The PlayStation Vita's 256 MB heap held every
+    // GT Mode page visited (MenuSet keeps them all) and ran out (std::bad_alloc: broken menus).
+    void set_source(std::function<std::optional<std::vector<u8>>()> source) { source_ = std::move(source); }
+    void drop_pixels() const;
+    void ensure_pixels() const;
     // Content patches (mods, src/menu/flow/menu_set.h MenuPatches): edit the layout and add
     // images (decoded RGBA) for new elements to reference. Only before the scene is drawn.
     PmbFile& mutable_file() { return file_; }
@@ -67,10 +80,15 @@ public:
     std::vector<DrawItem> draw_list(int page, const SceneOptions& o) const;
 
 private:
+    // Decodes the pmb's image `i` (data: the pmb file) into `out`; false (and a warning) if it fails.
+    static bool decode_image(const PmbFile& file, ByteSpan data, size_t i, MenuImage& out, const std::string& path);
+
     std::string path_;
     PmbFile file_;
-    std::vector<MenuImage> images_;
+    mutable std::vector<MenuImage> images_; // (mutable: drop_pixels / ensure_pixels)
     size_t image_failures_ = 0;
+    std::function<std::optional<std::vector<u8>>()> source_;
+    mutable bool pixels_dropped_ = false;
 };
 
 // Menu file naming: "menu/<LANG>/<screen><n>.pmb".

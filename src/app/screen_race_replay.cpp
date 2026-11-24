@@ -333,6 +333,7 @@ void RaceScreen::pick_attract_view() {
 // race music's markers (its object steps before the cameras), the shot length, view mode 1's
 // handler, then the next frame's cut request; and the dissolve's clock.
 void RaceScreen::update_camera_manager(double dt) {
+    GT3R_PROF("race.camera_manager");
     cut_acc_ += dt * 60.0;
     for (int i = 0; cut_acc_ >= 1.0 - 1e-9 && i < 12; ++i) {
         cut_acc_ -= 1.0;
@@ -548,6 +549,7 @@ void RaceScreen::step_replay_focus() {
 // Every frame of a replay or attract demo: the focus logic at 60 Hz, view mode 1's cuts, the
 // driver's view (Cross), and a new shot after a manual car change.
 void RaceScreen::update_replay_focus(double dt) {
+    GT3R_PROF("race.replay_focus");
     const bool focus = field_ && !two_player_;
     if (focus) {
         focus_acc_ += dt * 60.0;
@@ -600,6 +602,7 @@ void RaceScreen::aim_replay_camera() {
 }
 
 void RaceScreen::update_race_camera(const PadState& pad, double dt) {
+    GT3R_PROF("race.race_camera");
     const bool opponent = (replaying_ || attract_) && field_ && replay_focus_ >= 0 && replay_focus_ < field_->opponents();
     if ((replaying_ || attract_) && field_) aim_replay_camera();
     if (opponent) {
@@ -647,6 +650,7 @@ void RaceScreen::apply_post_pass(render::DrawOptions& o) const {
     const bool levels = replay && f.levels, filter = replay && f.filter;
     render::DrawOptions::PostGrade& g = o.post_grade;
     g.on = replay ? levels || filter : e.has_env && e.grade;
+    if (!grading_on_) g.on = false; // ([video] color_grading = off: no second full-screen pass)
     if (!g.on) return;
     g.black = levels ? f.black : e.has_env ? e.grade_black : 0.0f;
     g.white = levels ? f.white : e.has_env ? e.grade_white : 1.0f;

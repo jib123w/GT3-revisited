@@ -1,3 +1,4 @@
+#include "base/prof.h"
 #include "race/hud.h"
 
 #include "base/log.h"
@@ -823,6 +824,7 @@ void Hud::draw_rank(SDL_Renderer* r, const HudData& d, int view) {
 }
 
 void Hud::draw(SDL_Renderer* r, const HudData& d, const SDL_FRect* viewport) {
+    GT3R_PROF("hud.draw");
     g_screen = screen_;
     g_vp = viewport ? *viewport : screen_;
     g_43 = d.four_three;
@@ -1217,6 +1219,7 @@ SplitLayout split_layout(bool horizontal, float& event_w) {
 }
 
 void Hud::draw_split(SDL_Renderer* r, const HudData& d, const SDL_FRect& half, bool horizontal) {
+    GT3R_PROF("hud.draw_split");
     g_43 = false;
     g_dx = g_dy = 0, g_s = 1;
     pole_icon_rect_ = {0, 0, 0, 0};

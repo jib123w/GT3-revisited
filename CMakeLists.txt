@@ -82,7 +82,7 @@ endif()
 # fallback for PCs whose GPU SDL_GPU has no backend for (no Vulkan). It compiles to nothing
 # without GT3R_GLES.
 if(GT3R_VITA)
-  set(_gt3r_gles_default OFF) # the Vita's GPU has no OpenGL ES 3.0 (docs/dev/VITA.md)
+  set(_gt3r_gles_default ON) # on vitaGL, through SDL's vitaGL backend (docs/dev/VITA.md)
 elseif(WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID))
   set(_gt3r_gles_default ON)
 else()
@@ -261,21 +261,39 @@ endif()
 # PlayStation Vita: eboot.bin and the installable gt3r.vpk with its LiveArea pictures
 # (packaging/vita/sce_sys). The title ID is the homebrew's own: 9 characters, unique on the console.
 if(GT3R_VITA)
-  set(VITA_APP_NAME "GT3 Revisited")
+  set(VITA_APP_NAME "GT3") # (the LiveArea bubble's name)
   set(VITA_TITLEID "GT3R00001")
   set(VITA_VERSION "00.80") # project version 0.8.x, in the param.sfo's XX.YY form
   set(_vita_sys ${CMAKE_SOURCE_DIR}/packaging/vita/sce_sys)
+  # Your own pictures (packaging/vita/make_custom_art.ps1; git ignores them) over the placeholders.
+  set(_vita_art ${_vita_sys})
+  if(EXISTS ${CMAKE_SOURCE_DIR}/packaging/vita/custom/sce_sys/icon0.png)
+    set(_vita_art ${CMAKE_SOURCE_DIR}/packaging/vita/custom/sce_sys)
+  endif()
   # ATTRIBUTE2=12: extended memory mode, about 365 MB for the game instead of about 256 MB. The
   # 256 MB heap (src/app/vita_process.cpp) cannot be had without it: newlib gets no heap at all,
   # and the first allocation of the static initializers aborts.
   set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+  # vitaGL as built here (cmake/Dependencies.cmake), found ahead of VitaSDK's: SDL links it by name.
+  add_dependencies(gt3r vitagl)
+  target_link_directories(gt3r PRIVATE ${GT3R_VITAGL_DIR})
+  # (A rebuilt vitaGL relinks the game: SDL links it by name, so nothing else tells make to.)
+  set_property(TARGET gt3r APPEND PROPERTY LINK_DEPENDS ${GT3R_VITAGL_DIR}/libvitaGL.a)
+  # newlib's printf family has no %zu: every call goes through src/app/vita_process.cpp's rewrite.
+  target_link_options(gt3r PRIVATE
+    -Wl,--wrap=vsnprintf,--wrap=snprintf,--wrap=vsprintf,--wrap=sprintf,--wrap=vfprintf,--wrap=fprintf,--wrap=printf)
+  # Room after the code segment for the module data vita-elf-create appends there (~5 KB): without
+  # it the data segment starts at the next 64 KB boundary, and a build whose code ended within 5 KB
+  # of one failed ("Cannot allocate ... for SCE data at end of segment 0; segment 1 overlaps").
+  # VitaSDK's armvita.x adds __sce_headroom before that boundary.
+  target_link_options(gt3r PRIVATE -Wl,--defsym,__sce_headroom=0x4000)
   vita_create_self(eboot.bin gt3r UNSAFE)
   vita_create_vpk(gt3r.vpk ${VITA_TITLEID} eboot.bin
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}
-    FILE ${_vita_sys}/icon0.png sce_sys/icon0.png
-         ${_vita_sys}/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
-         ${_vita_sys}/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+    FILE ${_vita_art}/icon0.png sce_sys/icon0.png
+         ${_vita_art}/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+         ${_vita_art}/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
          ${_vita_sys}/livearea/contents/template.xml sce_sys/livearea/contents/template.xml)
 endif()
 

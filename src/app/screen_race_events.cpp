@@ -184,6 +184,7 @@ void RaceScreen::lap_events(bool timer_updated) {
 }
 
 void RaceScreen::draw_event_icons(App& app, int half) {
+    GT3R_PROF("race.event_icons");
     const SDL_FRect& rc = hud_.event_icon_rect();
     if (rc.w > 0) draw_car_icon(app, event_icon_car_[size_t(half)], rc, size_t(12 + half), true);
     // The free practice's P.P. line: the picture of the car holding the fastest lap.

@@ -56,7 +56,11 @@ public:
         std::vector<u32> indices;
     };
     const Geometry* geometry() const { return keep_ ? &geometry_ : nullptr; }
+#if defined(__vita__)
+    void keep_geometry() {} // (none kept on the Vita: the constructor)
+#else
     void keep_geometry() { keep_ = true; }
+#endif
 
     struct MeshInfo {
         Mat4 transform;

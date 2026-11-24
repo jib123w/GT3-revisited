@@ -1,5 +1,7 @@
 #include "render/gpu_model.h"
 
+#include "base/prof.h"
+
 #include "base/log.h"
 
 #include <algorithm>
@@ -119,7 +121,14 @@ bool ensure_buffer(SDL_GPUDevice* device, SDL_GPUBufferUsageFlags usage, SDL_GPU
 } // namespace
 
 GpuModel::GpuModel(GpuContext& ctx, const scene::Model& model, bool keep_geometry)
+#if defined(__vita__)
+    // (The Vita keeps none: only the guard-band clipping it leaves out reads them, View3D::upload_clipped,
+    // and a course's copy was megabytes of a heap the GT Mode menus ran out of after a race.)
+    : ctx_(&ctx), device_(ctx.device()), keep_(false) {
+    (void)keep_geometry;
+#else
     : ctx_(&ctx), device_(ctx.device()), keep_(keep_geometry) {
+#endif
     std::vector<scene::Vertex> vertices;
     std::vector<u32> indices;
     assemble(model.meshes, model.textures.size(), true, vertices, indices, meshes_);
@@ -190,6 +199,7 @@ bool GpuModel::update_vertices(const std::vector<scene::Vertex>& all) {
 }
 
 bool GpuModel::update_textures(const std::vector<TextureUpdate>& updates) {
+    GT3R_PROF("gpu.update_textures");
     bool ok = true;
     Uploader up(device_);
     for (const TextureUpdate& u : updates) {
@@ -214,6 +224,7 @@ GpuModel::GpuModel(GpuContext& ctx, const GpuModel& textures)
     : ctx_(&ctx), device_(ctx.device()), texture_source_(&textures) {}
 
 bool GpuModel::update_geometry(const std::vector<scene::Mesh>& meshes) {
+    GT3R_PROF("gpu.update_geometry");
     std::vector<scene::Vertex> vertices;
     std::vector<u32> indices;
     meshes_.clear();

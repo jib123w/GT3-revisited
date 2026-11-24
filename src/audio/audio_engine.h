@@ -166,6 +166,19 @@ private:
     float stream_level_ = 1.0f; // the current stream request's level
     float stream_trim_ = 1.0f;  // the current stream's own gain (a music file's loudness)
     bool music_finished_ = false;
+    // The music's position as feed() last left it: the piece's decoded position, that less what
+    // still waits in the stream, and when (SDL_GetTicksNS; 0: nothing fed since the piece
+    // started). music_audible_position reads them with no lock: the locks it used to take
+    // (mutex_, the stream's, the device's) are held by the audio thread through whole mixes, and
+    // the race's camera cuts ask for it 60 times a second (on the Vita, 120 ms of waiting a frame).
+    // music_ && !music_finished_, for music_playing() without mutex_ (asked every frame).
+    std::atomic<bool> music_live_{false};
+    // The callbacks' mixing buffers, kept between calls (the audio thread's; no allocation there).
+    std::vector<s16> voice_buf_, music_buf_;
+    std::atomic<double> fed_decoded_{0.0}, fed_unqueued_{0.0};
+    std::atomic<Uint64> fed_at_ns_{0};
+    // The device's own buffer (SDL_GetAudioDeviceFormat), asked once per device (-1: not yet).
+    mutable std::atomic<double> device_latency_s_{-1.0};
 
     VoiceMixer voices_;
     Sequencer sequencer_;

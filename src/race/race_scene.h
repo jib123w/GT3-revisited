@@ -21,9 +21,12 @@
 #include "sim/sim_types.h"
 
 #include <array>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gt3r::race {
@@ -99,6 +102,31 @@ private:
     ClutAnimations cluts_;
     Moving scenery_moving_, backdrop_moving_;
     bool moving_changed_ = true;
+#if defined(__vita__)
+    // PlayStation Vita: the moving nodes' geometry (their node programs, then every part moved and
+    // copied: ~13 ms an update on the main thread) is worked out on a thread of its own, on the
+    // third core; upload_animations sends up what it finished. While it works, animate() holds
+    // the nodes' time back (moving_pending_) instead of changing what it reads.
+    struct MovingJob {
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool pending = false, busy = false, done = false, quit = false;
+        std::vector<scene::Mesh> result[2]; // scenery_moving_'s, backdrop_moving_'s
+    };
+    std::unique_ptr<MovingJob> job_;
+    float moving_pending_ = 0;
+    void moving_worker();
+    bool moving_job_idle(); // (no job waiting or running)
+    void wait_moving_job();
+
+public:
+    ~CourseScene();
+    CourseScene(const CourseScene&) = delete;
+    CourseScene& operator=(const CourseScene&) = delete;
+
+private:
+#endif
     bool frame_alpha_ = false; // the scenery draws with the PS2's frame alpha (sheen masks)
     Occluder occluder_;
     std::unique_ptr<render::GpuModel> scenery_, line_, backdrop_, sky_, sky_low_;
@@ -302,7 +330,11 @@ render::Mat4 car_matrix(const sim::VehicleState& s);
 
 // The car LOD at `dist` metres from the camera for a model with `lods` levels: 0 under 30 m, 1 under
 // 80 m, else 2, at most lods - 1; 0 at any distance with `full_detail` ([video] full_car_detail = on).
+// The distances are GT3's times set_car_lod_scale's (1; [video] car_detail = low: a third, so the cars
+// round the player's own take the simpler models: a starting grid's full models were most of its
+// draws on the PlayStation Vita).
 int car_lod(float dist, int lods, bool full_detail = false);
+void set_car_lod_scale(float scale);
 
 // The car callback's values for a state (gtm1::RunParams::callback; RacePS2Base's frame, 0x1A9B00 on Tokyo-Geneva
 // Europe): ids 1-4 the flaps, 0.5 + 0.5 x (physics §8.8); id 5 the steering, 0.5 + 0.5 steer / lock (0.5 straight

@@ -10,7 +10,17 @@
 #include "race/arcade_car.h"
 #include "vfs/vfs.h"
 
+#include <SDL3/SDL_properties.h>
+#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_timer.h>
+
+#if defined(__vita__)
+#include <psp2/kernel/cpu.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
+
 #include <cmath>
+#include <memory>
 #include <mutex>
 
 namespace gt3r::race {
@@ -23,36 +33,74 @@ u64 hash_bytes(ByteSpan b) {
     return h;
 }
 
-std::mutex g_mutex;
+// The program data below, worked out once per program (g_mutex held meanwhile). Never destroyed: the prefetch thread may
+// still be working at exit.
+std::mutex& g_mutex = *new std::mutex;
+u64 g_key = 0;
+std::shared_ptr<const ex::ProgramData>& g_data = *new std::shared_ptr<const ex::ProgramData>;
+std::string& g_err = *new std::string;
+
+// The program data of a CORE.GT3, worked out once per program (with g_mutex held).
+std::shared_ptr<const ex::ProgramData> program_data_locked(ByteSpan core, std::string* error) {
+    const u64 k = hash_bytes(core);
+    if (k != g_key) {
+        g_key = k;
+        g_data.reset();
+        g_err.clear();
+        const Uint64 t0 = SDL_GetTicksNS();
+        try {
+            g_data = std::make_shared<const ex::ProgramData>(ex::ProgramData::load(CoreImage::decode(core)));
+            const RacePhysics how = race_physics(*g_data);
+            LOG_INFO("Race: %s physics%s (%.1f s to read the program)", race_core_name(how.core),
+                     how.own ? "" : " (this disc's own physics isn't supported yet)", double(SDL_GetTicksNS() - t0) / 1e9);
+        } catch (const std::exception& e) {
+            g_err = e.what();
+        }
+        if (!g_data) LOG_WARN("Race: exact physics unavailable: %s", g_err.c_str());
+    }
+    if (!g_data && error) *error = g_err;
+    return g_data;
+}
 
 } // namespace
 
 std::shared_ptr<const ex::ProgramData> exact_program_data(const Vfs& vfs, std::string* error) {
-    static u64 key = 0;
-    static std::shared_ptr<const ex::ProgramData> data;
-    static std::string err;
-    std::lock_guard<std::mutex> lock(g_mutex);
     std::optional<Bytes> core = vfs.read(Vfs::kProgramFile);
     if (!core || core->empty()) {
         if (error) *error = "the disc's program (CORE.GT3) cannot be read";
         return nullptr;
     }
-    const u64 k = hash_bytes(*core);
-    if (k != key) {
-        key = k;
-        data.reset();
-        err.clear();
-        try {
-            data = std::make_shared<const ex::ProgramData>(ex::ProgramData::load(CoreImage::decode(*core)));
-            const RacePhysics how = race_physics(*data);
-            LOG_INFO("Race: %s physics%s", race_core_name(how.core), how.own ? "" : " (this disc's own physics isn't supported yet)");
-        } catch (const std::exception& e) {
-            err = e.what();
-        }
-        if (!data) LOG_WARN("Race: exact physics unavailable: %s", err.c_str());
-    }
-    if (!data && error) *error = err;
-    return data;
+    std::lock_guard<std::mutex> lock(g_mutex); // (waits for prefetch_exact_program_data's work, if it runs)
+    return program_data_locked(*core, error);
+}
+
+void prefetch_exact_program_data(const Vfs& vfs) {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    std::optional<Bytes> core = vfs.read(Vfs::kProgramFile);
+    if (!core || core->empty()) return;
+    // The thread has the program's bytes only (not the Vfs, which a disc change replaces). An SDL thread with a stack of
+    // its own size: std::thread's on the Vita is its pthread default.
+    auto* job = new Bytes(std::move(*core));
+    auto run = [](void* p) -> int {
+        std::unique_ptr<Bytes> bytes(static_cast<Bytes*>(p));
+#if defined(__vita__)
+        sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2); // (the third core)
+#endif
+        std::lock_guard<std::mutex> lock(g_mutex);
+        program_data_locked(*bytes, nullptr);
+        return 0;
+    };
+    const SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, reinterpret_cast<void*>(+run));
+    SDL_SetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, "program data");
+    SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, job);
+    SDL_SetNumberProperty(props, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER, 1 << 20);
+    SDL_Thread* t = SDL_CreateThreadWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (t) SDL_DetachThread(t);
+    else delete job; // (the race works it out itself)
 }
 
 std::shared_ptr<const ex::ProgramData> record_program_data(const std::shared_ptr<const ex::ProgramData>& d, u64 program) {

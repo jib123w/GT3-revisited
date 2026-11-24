@@ -10,6 +10,7 @@
 // point hands the call on to SDL_GPU.
 
 #define GT3R_GLES_IMPL // SDL_GPU by its own names in this file
+#include "base/prof.h"
 #include "render/gpu_gles.h"
 
 #if GT3R_GLES
@@ -121,9 +122,109 @@ namespace {
 GT3R_GL_FUNCTIONS(X)
 #undef X
 
+#if defined(__vita__)
+// vitaGL (docs/dev/VITA.md) has all of the above but six; these stand in for them with what it
+// has. load_gl takes one only where the context has no function of that name.
+template <typename F>
+F vita_gl(const char* name) {
+    return reinterpret_cast<F>(SDL_GL_GetProcAddress(name));
+}
+
+void GL_APIENTRY vita_ClearBufferfv(GLenum buffer, GLint, const GLfloat* v) {
+    static const auto clear = vita_gl<PFNGLCLEARPROC>("glClear");
+    static const auto clear_color = vita_gl<PFNGLCLEARCOLORPROC>("glClearColor");
+    static const auto clear_depth = vita_gl<PFNGLCLEARDEPTHFPROC>("glClearDepthf");
+    if (buffer == GL_COLOR) {
+        clear_color(v[0], v[1], v[2], v[3]);
+        clear(GL_COLOR_BUFFER_BIT);
+    } else if (buffer == GL_DEPTH) {
+        clear_depth(v[0]);
+        clear(GL_DEPTH_BUFFER_BIT);
+    }
+}
+
+void GL_APIENTRY vita_ClearBufferfi(GLenum, GLint, GLfloat depth, GLint stencil) {
+    static const auto clear = vita_gl<PFNGLCLEARPROC>("glClear");
+    static const auto clear_depth = vita_gl<PFNGLCLEARDEPTHFPROC>("glClearDepthf");
+    static const auto clear_stencil = vita_gl<PFNGLCLEARSTENCILPROC>("glClearStencil");
+    clear_depth(depth);
+    clear_stencil(stencil);
+    clear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+}
+
+// No multisampled renderbuffers: no sample count is reported, so none is asked for.
+void GL_APIENTRY vita_GetInternalformativ(GLenum, GLenum, GLenum, GLsizei count, GLint* params) {
+    for (GLsizei i = 0; i < count; ++i) params[i] = 0;
+}
+
+void GL_APIENTRY vita_InvalidateFramebuffer(GLenum, GLsizei, const GLenum*) {} // a hint only
+
+void GL_APIENTRY vita_RenderbufferStorageMultisample(GLenum target, GLsizei, GLenum internal, GLsizei w, GLsizei h) {
+    glRenderbufferStorage(target, internal, w, h);
+}
+
+// The mip levels a texture gets on the Vita: the ones vitaGL makes room for. vitaGL lays a chain
+// out at the power-of-two sizes and ends it where the shorter side reaches 1 (gpu_alloc_mipmaps:
+// 256x16 has 5 levels, not the 9 of a full chain), and writes the levels asked after that past
+// the end of the texture's memory: glTexSubImage2D at its own offsets, and the levels a later
+// glTexImage2D asks are drawn by the GPU's downscale with no new memory. That broke the memory
+// pool's records beside course and car textures, and freeing them crashed (sceClibMspaceFree,
+// leaving a race or a showroom). So: power-of-two 2D textures only, at most to the shorter side's
+// 1; others one level (cube maps too: vitaGL has no cube mip chains).
+GLsizei vita_levels(GLenum target, Uint32 w, Uint32 h, GLsizei asked) {
+    const auto pot = [](Uint32 v) { return v != 0 && (v & (v - 1)) == 0; };
+    if (asked <= 1 || target != GL_TEXTURE_2D || !pot(w) || !pot(h)) return 1;
+    GLsizei n = 1;
+    for (Uint32 s = std::min(w, h); s > 1; s >>= 1) ++n;
+    return std::min(asked, n);
+}
+
+// Every face and level allocated at once, as immutable storage would be.
+void GL_APIENTRY vita_TexStorage2D(GLenum target, GLsizei levels, GLenum internal, GLsizei w, GLsizei h) {
+    GLenum format = GL_RGBA, type = GL_UNSIGNED_BYTE;
+    switch (internal) {
+    case GL_DEPTH_COMPONENT16: format = GL_DEPTH_COMPONENT, type = GL_UNSIGNED_SHORT; break;
+    case GL_DEPTH_COMPONENT24: format = GL_DEPTH_COMPONENT, type = GL_UNSIGNED_INT; break;
+    case 0x8DAB: format = GL_DEPTH_COMPONENT, type = GL_FLOAT; break; // vitaGL's GL_DEPTH_COMPONENT32F (tex_format)
+    case GL_DEPTH24_STENCIL8: format = GL_DEPTH_STENCIL, type = GL_UNSIGNED_INT_24_8; break;
+    case 0x8DAC: format = GL_DEPTH_STENCIL, type = GL_FLOAT_32_UNSIGNED_INT_24_8_REV; break; // vitaGL's GL_DEPTH32F_STENCIL8
+    default: break;
+    }
+    const int faces = target == GL_TEXTURE_CUBE_MAP ? 6 : 1;
+    for (int f = 0; f < faces; ++f) {
+        const GLenum face = faces == 6 ? GLenum(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f) : target;
+        for (GLsizei l = 0; l < levels; ++l)
+            glTexImage2D(face, l, GLint(internal), std::max(1, w >> l), std::max(1, h >> l), 0, format, type, nullptr);
+    }
+}
+
+void* vita_fallback(const char* name) {
+    struct Entry {
+        const char* name;
+        void* fn;
+    };
+    static const Entry kTable[] = {
+        {"glClearBufferfv", reinterpret_cast<void*>(&vita_ClearBufferfv)},
+        {"glClearBufferfi", reinterpret_cast<void*>(&vita_ClearBufferfi)},
+        {"glGetInternalformativ", reinterpret_cast<void*>(&vita_GetInternalformativ)},
+        {"glInvalidateFramebuffer", reinterpret_cast<void*>(&vita_InvalidateFramebuffer)},
+        {"glRenderbufferStorageMultisample", reinterpret_cast<void*>(&vita_RenderbufferStorageMultisample)},
+        {"glTexStorage2D", reinterpret_cast<void*>(&vita_TexStorage2D)},
+    };
+    for (const Entry& e : kTable)
+        if (std::strcmp(e.name, name) == 0) return e.fn;
+    return nullptr;
+}
+#define GT3R_GL_FALLBACK(type, name) \
+    if (!name) name = reinterpret_cast<type>(vita_fallback(#name));
+#else
+#define GT3R_GL_FALLBACK(type, name)
+#endif
+
 bool load_gl() {
 #define X(type, name)                                                         \
     name = reinterpret_cast<type>(SDL_GL_GetProcAddress(#name));             \
+    GT3R_GL_FALLBACK(type, name)                                              \
     if (!name) return SDL_SetError("OpenGL ES: the driver has no %s", #name);
     GT3R_GL_FUNCTIONS(X)
 #undef X
@@ -163,9 +264,18 @@ bool tex_format(SDL_GPUTextureFormat f, TexFormat* out) {
     case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM: *out = {GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE}; return true;
     case SDL_GPU_TEXTUREFORMAT_D16_UNORM: *out = {GL_DEPTH_COMPONENT16, 0, 0, true}; return true;
     case SDL_GPU_TEXTUREFORMAT_D24_UNORM: *out = {GL_DEPTH_COMPONENT24, 0, 0, true}; return true;
+#if defined(__vita__)
+    // vitaGL numbers the 32-bit float depth formats as NV_depth_buffer_float did (0x8DAB / 0x8DAC,
+    // not OpenGL ES 3.0's 0x8CAC / 0x8CAD) and refuses the others. Its depth buffer is float
+    // whatever is asked (DF32M), so D32_FLOAT is also what keeps the renderer's depth bias right.
+    case SDL_GPU_TEXTUREFORMAT_D32_FLOAT: *out = {0x8DAB, 0, 0, true}; return true;
+    case SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT: *out = {GL_DEPTH24_STENCIL8, 0, 0, true, true}; return true;
+    case SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT: *out = {0x8DAC, 0, 0, true, true}; return true;
+#else
     case SDL_GPU_TEXTUREFORMAT_D32_FLOAT: *out = {GL_DEPTH_COMPONENT32F, 0, 0, true}; return true;
     case SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT: *out = {GL_DEPTH24_STENCIL8, 0, 0, true, true}; return true;
     case SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT: *out = {GL_DEPTH32F_STENCIL8, 0, 0, true, true}; return true;
+#endif
     default: return false;
     }
 }
@@ -257,6 +367,7 @@ struct SDL_GPUTexture {
     GLuint tex = 0;    // texture: sampled, or a single-sample colour target
     GLuint rb = 0;     // renderbuffer: multisampled, or a depth target that is never sampled
     GLenum target = 0; // GL_TEXTURE_2D or GL_TEXTURE_CUBE_MAP (textures)
+    GLsizei levels = 1; // mip levels made (the Vita: fewer than asked, vita_levels)
 };
 
 struct SDL_GPUBuffer {
@@ -277,6 +388,7 @@ struct SDL_GPUShader {
     GLuint shader = 0;
     SDL_GPUShaderStage stage = SDL_GPU_SHADERSTAGE_VERTEX;
     std::vector<std::string> blocks, samplers; // names in slot order
+    std::vector<std::string> attributes;       // names in location order, bound before the link (Vita)
     Uint32 num_uniform_buffers = 0, num_samplers = 0;
 };
 
@@ -323,6 +435,9 @@ struct SDL_GPUDevice {
     bool angle = true;                // Windows: ANGLE when bundled (off: the driver's OpenGL ES)
     std::string description;          // gles::description()
     GLint ubo_align = 256;
+    // The largest uniform arena and draw list a pass has had: a new command buffer (one each
+    // submit) reserves them at once instead of growing them a reallocation at a time every frame.
+    size_t arena_hint = 0, draws_hint = 0;
     bool aniso = false;
     float max_aniso = 1;
     // glDrawElementsInstancedBaseVertex (OpenGL ES 3.2, or OES / EXT_draw_elements_base_vertex):
@@ -333,6 +448,26 @@ struct SDL_GPUDevice {
     GLuint vao = 0, ubo = 0;
     GLuint scratch_read = 0, scratch_draw = 0; // frame buffers for resolves and copies
     std::map<std::pair<GLuint, GLuint>, GLuint> programs;
+    // Shaders of a program that failed to link: never attached again (vitaGL compiles GLSL at
+    // link time, and attaching a shader it could not compile crashes it; docs/dev/VITA.md).
+    std::vector<GLuint> failed_shaders;
+#if defined(__vita__)
+    // Per program: its uniform arrays (render/shaders/vita_cg.h), vertex slots then fragment slots
+    // (kSlots each): the location (-1 where it has none) and the float4s the compiled program
+    // keeps. replay uploads each draw's blocks there, never more than `count`: the Cg compiler
+    // drops an array's unused tail, vitaGL sizes the program's uniform memory to what is left
+    // (calloc'd, sceGxmProgramGetDefaultUniformBufferSize), and glUniform4fv does not check the
+    // count, so a whole block written into a shortened array ran over the heap.
+    // `last`: the bytes last uploaded there. vitaGL keeps a program's uniforms and sends them
+    // again by itself when the program changes, so a block equal to its last upload is not
+    // uploaded again (and a draw with no new uniforms skips vitaGL's copy of them).
+    struct VitaBlock {
+        GLint loc = -1;
+        GLsizei count = 0;
+        std::vector<Uint8> last;
+    };
+    std::map<GLuint, std::vector<VitaBlock>> vita_block_locs;
+#endif
     // Render pass frame buffers: (colour object, colour layer, colour mip, depth object);
     // objects are GL names with bit 32 set for renderbuffers.
     std::map<std::tuple<Uint64, Uint32, Uint32, Uint64>, GLuint> fbos;
@@ -363,13 +498,70 @@ Uint64 object_key(const SDL_GPUTexture* t) {
     return t->rb ? (Uint64(1) << 32) | t->rb : Uint64(t->tex);
 }
 
+#if defined(__vita__)
+// vitaGL attaches 2D textures only (its glFramebufferTexture2D takes no cube face). A pass into a
+// cube face draws into a 2D stand-in of the face's size, one per cube and level, and run_pass
+// copies it into the face (vita_store_face): through the CPU in vitaGL (glReadPixels, then
+// glTexSubImage2D), so a slow copy. The environment cube and its 1x1 placeholder are the only
+// cubes drawn into, one face per pass, never read back or blitted (docs/dev/VITA.md).
+std::map<std::pair<GLuint, Uint32>, GLuint> g_vita_face_stand_ins;
+
+GLuint vita_face_stand_in(const SDL_GPUTexture* t, Uint32 mip) {
+    GLuint& tex = g_vita_face_stand_ins[{t->tex, mip}];
+    if (tex) return tex;
+    glGenTextures(1, &tex);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GLsizei(std::max<Uint32>(1, t->info.width >> mip)),
+                 GLsizei(std::max<Uint32>(1, t->info.height >> mip)), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+// The bound frame buffer (a face's stand-in) into the cube face.
+void vita_store_face(const SDL_GPUTexture* t, Uint32 layer, Uint32 mip, GLsizei w, GLsizei h) {
+    static const auto copy = vita_gl<PFNGLCOPYTEXSUBIMAGE2DPROC>("glCopyTexSubImage2D");
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, t->tex);
+    copy(GLenum(GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer), GLint(mip), 0, 0, 0, 0, w, h);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+}
+
+void vita_forget_stand_ins(const SDL_GPUTexture* t) {
+    for (auto it = g_vita_face_stand_ins.begin(); it != g_vita_face_stand_ins.end();) {
+        if (it->first.first == t->tex) {
+            glDeleteTextures(1, &it->second);
+            it = g_vita_face_stand_ins.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+#endif
+
 void attach(GLenum fb_target, GLenum attachment, const SDL_GPUTexture* t, Uint32 layer, Uint32 mip) {
     if (!t) {
+#if defined(__vita__)
+        // The copy frame buffers keep their last colour texture (vitaGL takes no colour
+        // renderbuffers, and a detach through glFramebufferTexture2D(0) throws the frame buffer's
+        // render target away: every copy and blit then made a new one, sceGxmCreateRenderTarget,
+        // and a race's end crashed in a scene that never began). Re-attaching a texture of the same
+        // size keeps the render target. A released texture they still hold is freed once they take
+        // another (vitaGL's ref_counter): two textures at most.
+        if (attachment == GL_COLOR_ATTACHMENT0) return;
+#endif
         glFramebufferRenderbuffer(fb_target, attachment, GL_RENDERBUFFER, 0);
     } else if (t->rb) {
         glFramebufferRenderbuffer(fb_target, attachment, GL_RENDERBUFFER, t->rb);
     } else if (t->target == GL_TEXTURE_CUBE_MAP) {
+#if defined(__vita__)
+        (void)layer; // the face is chosen when the stand-in is stored (vita_store_face)
+        glFramebufferTexture2D(fb_target, attachment, GL_TEXTURE_2D, vita_face_stand_in(t, mip), 0);
+#else
         glFramebufferTexture2D(fb_target, attachment, GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer, t->tex, GLint(mip));
+#endif
     } else {
         glFramebufferTexture2D(fb_target, attachment, GL_TEXTURE_2D, t->tex, GLint(mip));
     }
@@ -381,6 +573,11 @@ GLenum depth_attachment(const SDL_GPUTexture* t) {
 
 GLuint pass_fbo(SDL_GPUDevice* dev, const SDL_GPUTexture* color, Uint32 layer, Uint32 mip,
                 const SDL_GPUTexture* depth) {
+#if defined(__vita__)
+    // A cube's faces all draw into its one 2D stand-in (attach; run_pass stores the face): one frame
+    // buffer for them, not six (each a render target in vitaGL, of which the GPU has few).
+    if (color && color->target == GL_TEXTURE_CUBE_MAP) layer = 0;
+#endif
     auto key = std::make_tuple(object_key(color), layer, mip, object_key(depth));
     auto it = dev->fbos.find(key);
     if (it != dev->fbos.end()) {
@@ -497,7 +694,13 @@ void push_uniform(SDL_GPUCommandBuffer* cmd, int stage, Uint32 slot, const void*
 Uint32 arena_place(SDL_GPUCommandBuffer* cmd, int stage, Uint32 slot) {
     auto& u = cmd->uniforms[stage][slot];
     if (!u.in_arena) {
+#if defined(__vita__)
+        // (No uniform buffer ranges to bind: replay uploads from the arena with glUniform4fv, so
+        // float4 rows will do, not the 256-byte offsets that padded every block to 512 bytes.)
+        const size_t align = 16;
+#else
         const size_t align = size_t(std::max(cmd->dev->ubo_align, 16));
+#endif
         size_t off = (cmd->arena.size() + align - 1) / align * align;
         // Whole 16-byte rows: std140 blocks are bound by their full size.
         size_t len = (u.data.size() + 15) / 16 * 16;
@@ -547,7 +750,10 @@ void set_cap(GLenum cap, bool on, int& cur) {
     cur = int(on);
 }
 
-void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GLsizei h) {
+// `arena`: the command buffer's uniform data (the Vita reads the draws' blocks from it).
+void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GLsizei h, const Uint8* arena) {
+    GT3R_PROF("gl.replay");
+    (void)arena;
     ReplayState s;
     glBindVertexArray(dev->vao);
     for (const DrawRec& d : draws) {
@@ -608,6 +814,26 @@ void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GL
             }
             if (s.smp[i] != d.smp[i]) glBindSampler(i, s.smp[i] = d.smp[i]);
         }
+#if defined(__vita__)
+        // The blocks as uniform arrays (render/shaders/vita_cg.h), every draw: GL keeps uniforms
+        // per program, and vitaGL sends them with the draw.
+        static const auto uniform4fv = vita_gl<PFNGLUNIFORM4FVPROC>("glUniform4fv");
+        if (const auto it = dev->vita_block_locs.find(p->program); it != dev->vita_block_locs.end() && arena) {
+            for (int st = 0; st < 2; ++st) {
+                const Uint32 n = st == 0 ? p->vs_ubos : p->fs_ubos;
+                for (Uint32 k = 0; k < n && k < kSlots; ++k) {
+                    auto& b = it->second[size_t(st) * kSlots + k];
+                    const GLsizei count = std::min(GLsizei(d.ubo_size[st][k] / 16), b.count);
+                    if (b.loc < 0 || count <= 0) continue;
+                    const Uint8* data = arena + d.ubo_offset[st][k];
+                    const size_t bytes = size_t(count) * 16;
+                    if (b.last.size() == bytes && std::memcmp(b.last.data(), data, bytes) == 0) continue;
+                    b.last.assign(data, data + bytes);
+                    uniform4fv(b.loc, count, reinterpret_cast<const GLfloat*>(data));
+                }
+            }
+        }
+#else
         for (int st = 0; st < 2; ++st) {
             const Uint32 n = st == 0 ? p->vs_ubos : p->fs_ubos;
             for (Uint32 k = 0; k < n && k < kSlots; ++k) {
@@ -618,6 +844,7 @@ void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GL
                 s.ubo_size[st][k] = d.ubo_size[st][k];
             }
         }
+#endif
         const GLint vp[4] = {d.vp[0], d.vp[1], d.vp[2] > 0 ? d.vp[2] : w, d.vp[2] > 0 ? d.vp[3] : h};
         if (vp[0] != s.vp[0] || vp[1] != s.vp[1] || vp[2] != s.vp[2] || vp[3] != s.vp[3]) {
             glViewport(vp[0], vp[1], vp[2], vp[3]);
@@ -633,8 +860,10 @@ void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GL
         if (dev->draw_base_vertex)
             dev->draw_base_vertex(p->mode, GLsizei(d.count), d.ib_type, first, GLsizei(std::max<Uint32>(1, d.instances)),
                                   d.base_vertex);
+#if !defined(__vita__) // (the Vita: one instance; vitaGL's instanced draws fetch every stream by the instance)
         else if (d.instances > 1)
             glDrawElementsInstanced(p->mode, GLsizei(d.count), d.ib_type, first, GLsizei(d.instances));
+#endif
         else glDrawElements(p->mode, GLsizei(d.count), d.ib_type, first);
     }
     // Hand back the state SDL's renderer assumes (and the resolve blit after this: the scissor
@@ -667,6 +896,7 @@ void restore_defaults() {
 }
 
 void run_pass(SDL_GPURenderPass* pass) {
+    GT3R_PROF("gl.run_pass");
     SDL_GPUCommandBuffer* cmd = pass->cmd;
     SDL_GPUDevice* dev = cmd->dev;
     begin_gl(dev);
@@ -685,6 +915,9 @@ void run_pass(SDL_GPURenderPass* pass) {
     glViewport(0, 0, w, h);
     glDisable(GL_SCISSOR_TEST);
 
+    // (vitaGL starts the GPU scene at the first clear or draw: a wait there is the GPU behind.)
+    {
+    GT3R_PROF("gl.pass.begin");
     if (ct && pass->color.load_op == SDL_GPU_LOADOP_CLEAR) {
         const SDL_FColor& c = pass->color.clear_color;
         const GLfloat v[4] = {c.r, c.g, c.b, c.a};
@@ -696,12 +929,15 @@ void run_pass(SDL_GPURenderPass* pass) {
         if (dt->fmt.stencil) glClearBufferfi(GL_DEPTH_STENCIL, 0, pass->depth.clear_depth, pass->depth.clear_stencil);
         else glClearBufferfv(GL_DEPTH, 0, &pass->depth.clear_depth);
     }
+    }
 
     if (!pass->draws.empty()) {
+        const Uint8* arena = cmd->arena.empty() ? nullptr : reinterpret_cast<const Uint8*>(cmd->arena.data());
+#if !defined(__vita__) // (the Vita uploads the blocks as uniforms, from the arena itself: replay)
         glBindBuffer(GL_UNIFORM_BUFFER, dev->ubo);
-        glBufferData(GL_UNIFORM_BUFFER, GLsizeiptr(std::max<size_t>(cmd->arena.size(), 16)),
-                     cmd->arena.empty() ? nullptr : cmd->arena.data(), GL_STREAM_DRAW);
-        replay(dev, pass->draws, w, h);
+        glBufferData(GL_UNIFORM_BUFFER, GLsizeiptr(std::max<size_t>(cmd->arena.size(), 16)), arena, GL_STREAM_DRAW);
+#endif
+        replay(dev, pass->draws, w, h, arena);
     }
 
     // Multisample resolve into the resolve texture (a cube face, for cube resolves).
@@ -717,6 +953,14 @@ void run_pass(SDL_GPURenderPass* pass) {
         attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, nullptr, 0, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     }
+#if defined(__vita__)
+    // A cube face drew into its 2D stand-in (attach): now into the face. (No multisample resolve
+    // into a cube face: the Vita runs with one sample.)
+    if (ct && !ct->rb && ct->target == GL_TEXTURE_CUBE_MAP && store != SDL_GPU_STOREOP_DONT_CARE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        vita_store_face(ct, layer, mip, w, h);
+    }
+#endif
     // Contents nobody reads again need not be written back (tiled mobile GPUs).
     GLenum discard[2];
     GLsizei nd = 0;
@@ -838,6 +1082,10 @@ SDL_Renderer* create_es3_renderer(SDL_Window* window, bool debug) {
             return nullptr;
         }
         const char* v = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+#if defined(__vita__)
+        // vitaGL names its own version; it has the 3.0 calls used here (load_gl, with stand-ins).
+        if (v) return r;
+#endif
         if (v && std::strstr(v, "OpenGL ES 3")) return r;
         SDL_DestroyRenderer(r);
         if (attempt == 1) SDL_SetError("OpenGL ES 3.0 is not available (%s)", v ? v : "no context");
@@ -942,7 +1190,14 @@ SDL_GPUShader* gt3r_gl_CreateGPUShader(SDL_GPUDevice* device, const SDL_GPUShade
     }
     begin_gl(device);
     const bool vertex = info->stage == SDL_GPU_SHADERSTAGE_VERTEX;
+#if defined(__vita__)
+    // Cg (render/shaders/vita_cg.h): vitaGL's Cg shader types, compiled as they are (no GLSL
+    // translation) when glCompileShader is called.
+    constexpr GLenum kCgVertexShader = 0x890E, kCgFragmentShader = 0x890F; // GL_CG_*_SHADER_EXT
+    GLuint sh = glCreateShader(vertex ? kCgVertexShader : kCgFragmentShader);
+#else
     GLuint sh = glCreateShader(vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+#endif
     const GLchar* src = reinterpret_cast<const GLchar*>(info->code);
     const GLint len = GLint(info->code_size);
     glShaderSource(sh, 1, &src, &len);
@@ -963,6 +1218,7 @@ SDL_GPUShader* gt3r_gl_CreateGPUShader(SDL_GPUDevice* device, const SDL_GPUShade
     s->num_samplers = info->num_samplers;
     s->blocks = split_names(SDL_GetStringProperty(info->props, GT3R_GL_PROP_SHADER_UNIFORM_BLOCKS, ""));
     s->samplers = split_names(SDL_GetStringProperty(info->props, GT3R_GL_PROP_SHADER_SAMPLERS, ""));
+    s->attributes = split_names(SDL_GetStringProperty(info->props, GT3R_GL_PROP_SHADER_ATTRIBUTES, ""));
     return s;
 }
 
@@ -979,9 +1235,20 @@ namespace {
 GLuint program_for(SDL_GPUDevice* dev, const SDL_GPUShader* vs, const SDL_GPUShader* fs) {
     const auto key = std::make_pair(vs->shader, fs->shader);
     if (auto it = dev->programs.find(key); it != dev->programs.end()) return it->second;
+    const auto& failed = dev->failed_shaders;
+    if (std::find(failed.begin(), failed.end(), vs->shader) != failed.end() ||
+        std::find(failed.begin(), failed.end(), fs->shader) != failed.end()) {
+        SDL_SetError("GLSL ES link: a shader of this program failed to link before");
+        return 0;
+    }
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vs->shader);
     glAttachShader(prog, fs->shader);
+#if defined(__vita__)
+    // Cg attributes have no layout locations: the GLSL's, by name (vita_cg.h's *_attributes).
+    static const auto bind_attrib = vita_gl<PFNGLBINDATTRIBLOCATIONPROC>("glBindAttribLocation");
+    for (size_t i = 0; i < vs->attributes.size(); ++i) bind_attrib(prog, GLuint(i), vs->attributes[i].c_str());
+#endif
     glLinkProgram(prog);
     GLint ok = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &ok);
@@ -990,8 +1257,48 @@ GLuint program_for(SDL_GPUDevice* dev, const SDL_GPUShader* vs, const SDL_GPUSha
         glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
         SDL_SetError("GLSL ES link: %s", log);
         glDeleteProgram(prog);
+        dev->failed_shaders.push_back(vs->shader);
+        dev->failed_shaders.push_back(fs->shader);
         return 0;
     }
+#if defined(__vita__)
+    // The blocks are uniform arrays by the blocks' names (vita_cg.h): their locations, for replay.
+    auto& locs = dev->vita_block_locs[prog];
+    locs.assign(2 * kSlots, {});
+    // The arrays' compiled sizes (vitaGL: sceGxmProgramParameterGetArraySize), by name.
+    static const auto get_active_uniform = vita_gl<PFNGLGETACTIVEUNIFORMPROC>("glGetActiveUniform");
+    std::map<std::string, GLsizei> sizes;
+    GLint active = 0;
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &active);
+    for (GLint i = 0; i < active; ++i) {
+        char name[64] = {};
+        GLsizei len = 0;
+        GLint size = 0;
+        GLenum type = 0;
+        get_active_uniform(prog, GLuint(i), GLsizei(sizeof name), &len, &size, &type, name);
+        std::string n(name, size_t(std::clamp<GLsizei>(len, 0, GLsizei(sizeof name) - 1)));
+        if (n.size() > 3 && n.compare(n.size() - 3, 3, "[0]") == 0) n.resize(n.size() - 3);
+        sizes[n] = size;
+    }
+    const auto block = [&](const std::string& name) {
+        SDL_GPUDevice::VitaBlock b;
+        b.loc = glGetUniformLocation(prog, name.c_str());
+        if (b.loc < 0) b.loc = glGetUniformLocation(prog, (name + "[0]").c_str());
+        if (const auto it = sizes.find(name); it != sizes.end()) b.count = it->second;
+        if (b.loc < 0 || b.count <= 0) b = {};
+        return b;
+    };
+    std::string kept;
+    for (size_t i = 0; i < vs->blocks.size() && i < size_t(kSlots); ++i) {
+        locs[i] = block(vs->blocks[i]);
+        kept += " " + vs->blocks[i] + "[" + std::to_string(locs[i].count) + "]";
+    }
+    for (size_t i = 0; i < fs->blocks.size() && i < size_t(kSlots); ++i) {
+        locs[kSlots + i] = block(fs->blocks[i]);
+        kept += " " + fs->blocks[i] + "[" + std::to_string(locs[kSlots + i].count) + "]";
+    }
+    LOG_INFO("vitaGL program %u: uniform arrays%s", prog, kept.c_str());
+#else
     // Uniform blocks to binding points by slot; samplers to texture units by slot.
     for (size_t i = 0; i < vs->blocks.size(); ++i) {
         GLuint idx = glGetUniformBlockIndex(prog, vs->blocks[i].c_str());
@@ -1001,6 +1308,7 @@ GLuint program_for(SDL_GPUDevice* dev, const SDL_GPUShader* vs, const SDL_GPUSha
         GLuint idx = glGetUniformBlockIndex(prog, fs->blocks[i].c_str());
         if (idx != GL_INVALID_INDEX) glUniformBlockBinding(prog, idx, kFragmentUboBase + GLuint(i));
     }
+#endif
     glUseProgram(prog);
     for (size_t i = 0; i < fs->samplers.size(); ++i) {
         GLint loc = glGetUniformLocation(prog, fs->samplers[i].c_str());
@@ -1142,7 +1450,11 @@ SDL_GPUTexture* gt3r_gl_CreateGPUTexture(SDL_GPUDevice* device, const SDL_GPUTex
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
     } else {
         t->target = info->type == SDL_GPU_TEXTURETYPE_CUBE ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
-        const GLsizei levels = GLsizei(std::max<Uint32>(1, info->num_levels));
+        GLsizei levels = GLsizei(std::max<Uint32>(1, info->num_levels));
+#if defined(__vita__)
+        levels = vita_levels(t->target, info->width, info->height, levels);
+#endif
+        t->levels = levels;
         glGenTextures(1, &t->tex);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(t->target, t->tex);
@@ -1151,7 +1463,9 @@ SDL_GPUTexture* gt3r_gl_CreateGPUTexture(SDL_GPUDevice* device, const SDL_GPUTex
             // with glTexImage2D, which immutable storage rejects.
             glTexImage2D(GL_TEXTURE_2D, 0, GLint(f.internal), GLsizei(info->width), GLsizei(info->height), 0, f.format,
                          f.type, nullptr);
+#if !defined(__vita__) // (vitaGL has no GL_TEXTURE_MAX_LEVEL: GL_INVALID_ENUM, logged)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+#endif
         } else {
             glTexStorage2D(t->target, levels, f.internal, GLsizei(info->width), GLsizei(info->height));
         }
@@ -1170,6 +1484,9 @@ void gt3r_gl_ReleaseGPUTexture(SDL_GPUDevice* device, SDL_GPUTexture* texture) {
     if (!texture) return;
     begin_gl(device);
     if (device) forget_fbos(device, texture);
+#if defined(__vita__)
+    if (texture->tex && texture->target == GL_TEXTURE_CUBE_MAP) vita_forget_stand_ins(texture);
+#endif
     if (texture->tex) glDeleteTextures(1, &texture->tex);
     if (texture->rb) glDeleteRenderbuffers(1, &texture->rb);
     delete texture;
@@ -1233,10 +1550,13 @@ SDL_GPUCommandBuffer* gt3r_gl_AcquireGPUCommandBuffer(SDL_GPUDevice* device) {
     c->dev = device;
     c->pass.cmd = c;
     c->copy.cmd = c;
+    c->arena.reserve(device->arena_hint);
+    c->pass.draws.reserve(device->draws_hint);
     return c;
 }
 
 bool gt3r_gl_SubmitGPUCommandBuffer(SDL_GPUCommandBuffer* cmd) {
+    GT3R_PROF("gl.submit");
     if (!g_device) return SDL_SubmitGPUCommandBuffer(cmd);
     if (!cmd) return false;
     if (cmd->pass.open) run_pass(&cmd->pass); // not ended: SDL_GPU would reject it; draw what was recorded
@@ -1279,6 +1599,7 @@ void gt3r_gl_EndGPUCopyPass(SDL_GPUCopyPass* copy_pass) {
 
 void gt3r_gl_UploadToGPUBuffer(SDL_GPUCopyPass* copy, const SDL_GPUTransferBufferLocation* src,
                                const SDL_GPUBufferRegion* dst, bool cycle) {
+    GT3R_PROF("gl.upload_buffer");
     if (!g_device) return SDL_UploadToGPUBuffer(copy, src, dst, cycle);
     if (!copy || !src || !dst || !src->transfer_buffer || !dst->buffer) return;
     SDL_GPUBuffer* b = dst->buffer;
@@ -1288,6 +1609,15 @@ void gt3r_gl_UploadToGPUBuffer(SDL_GPUCopyPass* copy, const SDL_GPUTransferBuffe
     const Uint8* data = src->transfer_buffer->data.data() + src->offset;
     if (dst->offset == 0 && dst->size == b->size) // whole buffer: new storage, no wait on draws using the old
         glBufferData(b->target, GLsizeiptr(b->size), data, GL_STATIC_DRAW);
+#if defined(__vita__)
+    // vitaGL's glBufferSubData into a buffer drawn from in the last frames copies the whole buffer
+    // into new storage around the update (the streamed smoke, glows and wet road: every frame). A
+    // cycled upload from the start keeps nothing after it, so new storage first, then the data.
+    else if (cycle && dst->offset == 0) {
+        glBufferData(b->target, GLsizeiptr(b->size), nullptr, GL_STATIC_DRAW);
+        glBufferSubData(b->target, 0, GLsizeiptr(dst->size), data);
+    }
+#endif
     else
         glBufferSubData(b->target, GLintptr(dst->offset), GLsizeiptr(dst->size), data);
     glBindBuffer(b->target, 0);
@@ -1295,10 +1625,12 @@ void gt3r_gl_UploadToGPUBuffer(SDL_GPUCopyPass* copy, const SDL_GPUTransferBuffe
 
 void gt3r_gl_UploadToGPUTexture(SDL_GPUCopyPass* copy, const SDL_GPUTextureTransferInfo* src,
                                 const SDL_GPUTextureRegion* dst, bool cycle) {
+    GT3R_PROF("gl.upload_texture");
     if (!g_device) return SDL_UploadToGPUTexture(copy, src, dst, cycle);
     if (!copy || !src || !dst || !src->transfer_buffer || !dst->texture || !dst->texture->tex) return;
     SDL_GPUTexture* t = dst->texture;
     if (!t->fmt.format) return; // depth
+    if (GLsizei(dst->mip_level) >= t->levels) return; // (a level the Vita did not make: vita_levels)
     const Uint32 row = src->pixels_per_row ? src->pixels_per_row : dst->w;
     if (size_t(src->offset) + size_t(row) * (dst->h ? dst->h - 1 : 0) * 4 + size_t(dst->w) * 4 >
         src->transfer_buffer->data.size())
@@ -1332,6 +1664,7 @@ void gt3r_gl_DownloadFromGPUTexture(SDL_GPUCopyPass* copy, const SDL_GPUTextureR
 
 void gt3r_gl_CopyGPUTextureToTexture(SDL_GPUCopyPass* copy, const SDL_GPUTextureLocation* src,
                                      const SDL_GPUTextureLocation* dst, Uint32 w, Uint32 h, Uint32 d, bool cycle) {
+    GT3R_PROF("gl.copy_texture");
     if (!g_device) return SDL_CopyGPUTextureToTexture(copy, src, dst, w, h, d, cycle);
     if (!copy || !src || !dst || !src->texture || !dst->texture) return;
     SDL_GPUDevice* dev = copy->cmd->dev;
@@ -1351,6 +1684,7 @@ void gt3r_gl_CopyGPUTextureToTexture(SDL_GPUCopyPass* copy, const SDL_GPUTexture
 // Region to region, scaled with `filter` (no flips; the load op is the blit's own: every texel of
 // the destination region is written).
 void gt3r_gl_BlitGPUTexture(SDL_GPUCommandBuffer* cmd, const SDL_GPUBlitInfo* info) {
+    GT3R_PROF("gl.blit");
     if (!g_device) return SDL_BlitGPUTexture(cmd, info);
     if (!cmd || !info || !info->source.texture || !info->destination.texture) return;
     const SDL_GPUBlitRegion &src = info->source, &dst = info->destination;
@@ -1371,7 +1705,7 @@ void gt3r_gl_BlitGPUTexture(SDL_GPUCommandBuffer* cmd, const SDL_GPUBlitInfo* in
 
 void gt3r_gl_GenerateMipmapsForGPUTexture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* t) {
     if (!g_device) return SDL_GenerateMipmapsForGPUTexture(cmd, t);
-    if (!cmd || !t || !t->tex || t->info.num_levels < 2) return;
+    if (!cmd || !t || !t->tex || t->levels < 2) return;
     begin_gl(cmd->dev);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(t->target, t->tex);
@@ -1408,6 +1742,10 @@ SDL_GPURenderPass* gt3r_gl_BeginGPURenderPass(SDL_GPUCommandBuffer* cmd, const S
 void gt3r_gl_EndGPURenderPass(SDL_GPURenderPass* pass) {
     if (!g_device) return SDL_EndGPURenderPass(pass);
     if (!pass || !pass->open) return;
+    if (SDL_GPUDevice* dev = pass->cmd ? pass->cmd->dev : nullptr) {
+        dev->arena_hint = std::max(dev->arena_hint, pass->cmd->arena.size());
+        dev->draws_hint = std::max(dev->draws_hint, pass->draws.size());
+    }
     run_pass(pass);
     pass->open = false;
     pass->draws.clear();

@@ -127,6 +127,7 @@ void RaceScreen::update(App& app, double dt) {
             }
         return;
     }
+    if (stage_ == Stage::Drive) read_live_settings(app); // (the Settings tab over a race: at once)
     if (stage_ == Stage::Select) update_select(app);
     else if (stage_ == Stage::Drive) update_drive(app, dt);
     // Screenshots: the pause menu's Exit in a live run once it has driven exit_laps laps.
@@ -413,6 +414,7 @@ void RaceScreen::toast(std::string s) {
 }
 
 void RaceScreen::log_perf(bool force) {
+    GT3R_PROF("race.log_perf");
     if (!course_scene_) return;
     if (force && perf_.frames > 0) perf_.window = 1e9;
     if (!perf_.roll()) return;

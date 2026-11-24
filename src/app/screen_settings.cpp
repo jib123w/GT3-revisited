@@ -47,6 +47,11 @@ namespace {
 enum Tab { kDisplay, kAudio, kControls, kCameras, kFfb, kTouch, kDisc, kOnline, kVr, kTabCount };
 const char* const kTabNames[kTabCount] = {"Display", "Audio",        "Controls", "Cameras", "Rumble & feedback",
                                           "Touch",   "Disc & saves", "Online",   "VR"};
+#elif defined(__vita__)
+// PlayStation Vita: no rumble, wheels or force feedback, no on-screen touch controls (the buttons
+// drive), no network yet: those pages are left out (their numbers stay out of the tab range).
+enum Tab { kDisplay, kAudio, kControls, kCameras, kDisc, kTabCount, kFfb = 100, kTouch, kOnline };
+const char* const kTabNames[kTabCount] = {"Display", "Audio", "Controls", "Cameras", "Disc & saves"};
 #else
 enum Tab { kDisplay, kAudio, kControls, kCameras, kFfb, kTouch, kDisc, kOnline, kTabCount };
 const char* const kTabNames[kTabCount] = {"Display", "Audio",        "Controls", "Cameras", "Rumble & feedback",
@@ -559,7 +564,12 @@ private:
     void build(App& app) {
         rows_.clear();
         switch (tab_) {
-        case kDisplay: build_display(app); break;
+        case kDisplay:
+            build_display(app);
+#if defined(__vita__)
+            arrange_vita_display();
+#endif
+            break;
         case kAudio: build_audio(app); break;
         case kControls: build_controls(app); break;
         case kCameras: build_cameras(app); break;
@@ -572,8 +582,58 @@ private:
 #endif
         default: break;
         }
+#if defined(__vita__)
+        // Rows that do nothing on the Vita, on every page: always fullscreen, one sample, vitaGL's
+        // renderer only, no anisotropic filtering, no window to lose focus, no Xbox pads or keyboard
+        // to speak of, one audio output, no music folder to open or allow.
+        static const char* const kVitaHidden[] = {"Fullscreen",          "Anti-aliasing (MSAA)", "Anisotropic filtering",
+                                                  "3D renderer",         "Controllers in the background",
+                                                  "Xbox controllers",    "Keyboard",             "Output device",
+                                                  "Audio device",        "Open music folder",    "Allow music access"};
+        std::erase_if(rows_, [](const Row& r) {
+            for (const char* h : kVitaHidden)
+                if (r.label == h) return true;
+            return false;
+        });
+#endif
         if (sel_ < 0 || sel_ >= int(rows_.size()) || !rows_[sel_].selectable()) sel_ = first_selectable();
     }
+
+#if defined(__vita__)
+    // PlayStation Vita: the Display page in groups, what matters for the frame rate first (build()
+    // then leaves out the rows that do nothing there). Rows by their labels; a "#" entry is a
+    // heading. Rows not listed stay, after the rest.
+    void arrange_vita_display() {
+        static const char* const kOrder[] = {
+            "#Performance",   "Performance profile", "Frame rate limit",       "Physics",
+            "FPS counter",    "#Picture",            "3D resolution",          "Dynamic resolution",
+            "VSync",          "Aspect ratio",        "Gamma",                  "Reset gamma to 1.00",
+            "#Details",       "Draw distance",       "Scenery animation",      "Car reflections",
+            "Car shadows",    "Rear-view mirror",    "Colour grading",         "Car detail",
+            "Always show full car detail",
+            "Showroom wheels in races",
+            "Sharp cars and prizes in menus",        "#Replays",               "Depth of field in replays",
+            "Heat haze in replays", "Vignette in replays", "Motion trail in replays", "#Game",
+            "Speed units"};
+        std::vector<Row> rest = std::move(rows_);
+        rows_.clear();
+        std::vector<bool> used(rest.size(), false);
+        for (const char* name : kOrder) {
+            if (name[0] == '#') {
+                heading(name + 1);
+                continue;
+            }
+            for (size_t i = 0; i < rest.size(); ++i)
+                if (!used[i] && rest[i].label == name) {
+                    rows_.push_back(std::move(rest[i]));
+                    used[i] = true;
+                    break;
+                }
+        }
+        for (size_t i = 0; i < rest.size(); ++i)
+            if (!used[i]) rows_.push_back(std::move(rest[i]));
+    }
+#endif
 
     void build_display(App& app) {
         App* a = &app;
@@ -583,6 +643,23 @@ private:
                    [a](bool v) { a->set_fullscreen(v); });
         else
             info("Fullscreen", "Always on this device");
+
+        // [video] performance profiles (App::set_performance_profile): the graphics rows below at
+        // once. Custom (offered only while it is the case): none of the profiles' sets matches.
+        {
+            std::vector<std::string> names;
+            for (int i = 0; i < App::performance_profile_count(); ++i) names.push_back(App::performance_profile_name(i));
+            const int current = app.performance_profile();
+            std::string desc = "Sets the graphics settings below at once (draw distance, scenery animation, the mirror, colour grading and car detail change at once, the rest when the next race starts). ";
+            if (current >= 0) desc += App::performance_profile_desc(current);
+            else desc += "Custom: your own mix of them.", names.push_back("Custom");
+            Row& profile = choice("Performance profile", desc, names, current >= 0 ? current : int(names.size()) - 1,
+                                  [a](int i) {
+                                      if (i < App::performance_profile_count()) a->set_performance_profile(i);
+                                  });
+            profile.enabled = app.gpu() != nullptr;
+            if (!profile.enabled) profile.desc = "Needs the 3D renderer (turn it on and restart).";
+        }
 
         // [video] aspect: the game's screens (menus, races, movies); ours keep their own layout.
         // Not in VR: the headset's virtual screen is 16:9 and the stereo views have its own FOV.
@@ -625,14 +702,40 @@ private:
                 a->config().set("video", "vsync", v ? "1" : "0");
                 SDL_SetRenderVSync(a->renderer(), v ? 1 : 0);
                 a->save_config();
+                a->apply_frame_limit(); // (with vsync a limit of every refresh needs no main loop rate)
             });
-        if (vr)
-            info("Limit to 60 fps", "Not in VR", "The headset draws a frame for each of its refreshes.");
-        else
-            toggle("Limit to 60 fps",
-                   "On 120 Hz and faster displays, draw about 60 frames a second (the game runs at 60 Hz). "
-                   "Steadier when the computer is busy.",
-                   app.limit_60fps(), [a](bool v) { a->set_limit_60fps(v); });
+        // [video] fps_lock (App::fps_lock; it took over limit_60fps = on, which reads as 60).
+        static const int kLocks[] = {0, 60, 30, 20};
+        if (vr) {
+            info("Frame rate limit", "Not in VR", "The headset draws a frame for each of its refreshes.");
+        } else {
+            const int lock = app.fps_lock();
+            std::vector<std::string> lock_names = {"Off", "60 fps", "30 fps", "20 fps"};
+            int lock_idx = -1;
+            for (int i = 0; i < 4; ++i)
+                if (lock == kLocks[i]) lock_idx = i;
+            if (lock_idx < 0) lock_names.push_back(std::to_string(lock) + " fps"), lock_idx = 4; // (set in the file)
+            choice("Frame rate limit",
+                   "At most this many frames a second, each on a display refresh (30 on a 60 Hz screen: every "
+                   "second refresh; 60 on a 120 Hz one: every second). A steady rate looks smoother than one that "
+                   "wanders above it. Off: as fast as the display, or the machine, allows.",
+                   lock_names, lock_idx, [a](int i) {
+                       if (i < 4) a->set_fps_lock(kLocks[i]);
+                   });
+        }
+#if defined(__vita__)
+        // [race] physics = exact | fast (ee::HostMathScope: the race step in the Vita's FPU)
+        const bool fast_physics = to_lower(cfg.get("race", "physics").value_or("exact")) == "fast";
+        choice("Physics",
+               "Exact: GT3's own arithmetic, bit for bit as the PS2 computed it. Fast: the same physics in the Vita's own "
+               "floating point, much quicker (the physics is the slowest part of a race here); results can differ in "
+               "the last bit, so the disc's recorded demonstrations and replays made with Exact may drift. A race "
+               "in progress changes at once.",
+               {"Exact", "Fast"}, fast_physics ? 1 : 0, [a](int i) {
+                   a->config().set("race", "physics", i == 1 ? "fast" : "exact");
+                   a->save_config();
+               });
+#endif
         toggle("FPS counter", "Show the frames drawn per second in a corner of the screen.", app.show_fps(),
                [a](bool v) { a->set_show_fps(v); });
 
@@ -759,6 +862,85 @@ private:
                            });
         rims.enabled = scale.enabled;
         if (!rims.enabled) rims.desc = msaa.desc;
+
+        // [video] car_reflections = on | off (default on; off on the PlayStation Vita:
+        // RaceScreen::update_env_cube, App::video_setting)
+        Row& reflections = toggle("Car reflections",
+                                  "The course around your car reflected in its paint, drawn again every frame (six "
+                                  "more views of the course: slow on handhelds). Off: GT3's sky and scenery colors.",
+                                  app.video_setting("car_reflections") != "off", [a](bool v) {
+                                      a->config().set("video", "car_reflections", v ? "on" : "off");
+                                      a->save_config();
+                                  });
+        reflections.enabled = scale.enabled;
+        if (!reflections.enabled) reflections.desc = msaa.desc;
+
+        // [video] car_shadows = on | off (default on)
+        Row& shadows = toggle("Car shadows", "The shadows under the cars. Off: fewer draws for slow machines.",
+                              app.video_setting("car_shadows") != "off", [a](bool v) {
+                                  a->config().set("video", "car_shadows", v ? "on" : "off");
+                                  a->save_config();
+                              });
+        shadows.enabled = scale.enabled;
+        if (!shadows.enabled) shadows.desc = msaa.desc;
+
+        // [video] draw_distance = 100 | 75 | 50 (percent of GT3's far plane; RaceScreen::draw_options)
+        static const char* const kDrawShare[] = {"100", "75", "50"};
+        const int share = std::atoi(app.video_setting("draw_distance").c_str());
+        Row& distance = choice("Draw distance",
+                               "How far the course's scenery is drawn, as a share of GT3's own distance. Lower: "
+                               "fewer draws for slow machines, and far scenery pops in.",
+                               {"100%", "75%", "50%"}, share <= 50 ? 2 : share <= 75 ? 1 : 0, [a](int i) {
+                                   a->config().set("video", "draw_distance", kDrawShare[i]);
+                                   a->save_config();
+                               });
+        distance.enabled = scale.enabled;
+        if (!distance.enabled) distance.desc = msaa.desc;
+
+        // [video] scenery_animation = full | reduced (RaceScreen::animate_course)
+        Row& animation = choice("Scenery animation",
+                                "The course's animations: crowds, flags, light boards and moving objects. Reduced: "
+                                "they move in steps, 6 a second (still on time), and need far fewer uploads a frame.",
+                                {"Full", "Reduced"}, app.video_setting("scenery_animation") == "reduced" ? 1 : 0,
+                                [a](int i) {
+                                    a->config().set("video", "scenery_animation", i == 1 ? "reduced" : "full");
+                                    a->save_config();
+                                });
+        animation.enabled = scale.enabled;
+        if (!animation.enabled) animation.desc = msaa.desc;
+
+        // [video] rear_mirror = on | off (RaceScreen::draw_mirror; read every race frame)
+        Row& mirror = toggle("Rear-view mirror",
+                             "The mirror at the top of in-car and bumper views. It draws the course a second time "
+                             "(a fifth of a frame on handhelds). Off: no mirror.",
+                             app.video_setting("rear_mirror") != "off", [a](bool v) {
+                                 a->config().set("video", "rear_mirror", v ? "on" : "off");
+                                 a->save_config();
+                             });
+        mirror.enabled = scale.enabled;
+        if (!mirror.enabled) mirror.desc = msaa.desc;
+
+        // [video] color_grading = on | off (RaceScreen::apply_post_pass; read every race frame)
+        Row& grading = toggle("Colour grading",
+                              "GT3's colour tone on the courses that have one, and the replay cameras' colour filters: "
+                              "a second pass over the whole picture every frame. Off: the colours as drawn.",
+                              app.video_setting("color_grading") != "off", [a](bool v) {
+                                  a->config().set("video", "color_grading", v ? "on" : "off");
+                                  a->save_config();
+                              });
+        grading.enabled = scale.enabled;
+        if (!grading.enabled) grading.desc = msaa.desc;
+
+        // [video] car_detail = normal | low (race::car_lod; read every race frame)
+        Row& cars = choice("Car detail",
+                           "When cars switch to GT3's simpler models. Normal: GT3's distances (30 and 80 m). Low: a "
+                           "third of them, so the cars round you (a starting grid, a pack) draw far less.",
+                           {"Normal", "Low"}, app.video_setting("car_detail") == "low" ? 1 : 0, [a](int i) {
+                               a->config().set("video", "car_detail", i == 1 ? "low" : "normal");
+                               a->save_config();
+                           });
+        cars.enabled = scale.enabled;
+        if (!cars.enabled) cars.desc = msaa.desc;
 
         Row& sharp = toggle("Sharp cars and prizes in menus",
                             platform::is_mobile()

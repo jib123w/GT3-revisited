@@ -95,6 +95,7 @@ void RaceScreen::next_view(CameraRig& cam, int player) {
 // the open screen sets it too). None in the disc's demonstrations and the attract demo, and none in
 // VR, where the head looks around.
 void RaceScreen::look_around([[maybe_unused]] App& app, CameraRig& cam, const PadState& pad) const {
+    GT3R_PROF("race.look_around");
     bool on = !demo_ && !attract_;
 #if GT3R_XR
     if (vr_stereo(app, two_player_ && field_ && field_->has_second())) on = false;
@@ -103,8 +104,12 @@ void RaceScreen::look_around([[maybe_unused]] App& app, CameraRig& cam, const Pa
 }
 
 void RaceScreen::tick(App& app, const PadState& pad) {
+    GT3R_PROF("race.tick");
     double dt = step_.step();
-    animate_course(float(dt)); // the course's animations run with the race
+    {
+        GT3R_PROF("race.tick.animate_course");
+        animate_course(float(dt)); // the course's animations run with the race
+    }
     sim::ControlInputs in;
     // The race pad when it drives this step (the car reads it itself: RaceVehicle::set_pad); player 2's.
     const PadState* live_pad = nullptr;
@@ -193,7 +198,13 @@ void RaceScreen::tick(App& app, const PadState& pad) {
         for (int i = 0; i < f->opponents(); ++i) brake_lamps_.push(2 + size_t(i), f->opponent_brake(i));
     if (online_) online_before_step(dt);
     vehicle_->set_pad(live_pad);
-    vehicle_->step(in, dt);
+    {
+        GT3R_PROF("race.tick.vehicle_step");
+#if GT3R_EE_HOST_MATH
+        ee::HostMathScope host_math(host_math_); // ([race] physics = fast)
+#endif
+        vehicle_->step(in, dt);
+    }
     if (!replaying_) recorder_.set_driver_kind(vehicle_->driver_kind());
     // The car read the race pad itself (its record keeps the frame, which a replay plays): the replay's inputs, for its HUD,
     // are the ones whose frame (exact_inputs_frame) is the one it read (the handbrake and the back axis as on / off).
@@ -499,6 +510,7 @@ int RaceScreen::pod_prompt(int player) const {
 }
 
 void RaceScreen::update_drive(App& app, double dt) {
+    GT3R_PROF("race.update_drive");
     // A pod race's three notes (RacePODDisplay, 0x1AF650: with the race live, 3 s each, the first 2 s in, so they run
     // through the start's countdown; one player's race only, the 2 player display has none).
     if (!pod_intro_posted_ && !two_player_ && !replaying_ && !backdrop_ && !quick_ && !attract_ && pod_race()) {
@@ -882,6 +894,7 @@ void RaceScreen::update_pylons(double dt) {
 
 // Tyre smoke / dust: every car's wheels emit each tick (their smoke emission, physics §8.3b), then the puffs move.
 void RaceScreen::update_smoke(double dt) {
+    GT3R_PROF("race.smoke");
     if (!smoke_.loaded()) return;
     const track::Track* rt = track_ ? track_->runtime() : nullptr;
     auto car = [&](const sim::VehicleState& st, const sim::VehicleTelemetry* tp) {

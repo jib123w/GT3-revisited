@@ -1,0 +1,65 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 35c0308..c12a50a 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -122,12 +122,28 @@ char vgl_file_cache_path[256];
+ 		} \
+ 	}
+ 
++// GT3 Revisited: SceGxmVertexAttribute.offset is 16 bits, so the whole offset of an attribute into
++// a large vertex buffer wrapped past 64 KB, and a mesh stored that far in read its vertices from
++// elsewhere. The stream starts at the lowest enabled attribute's offset instead (vbo_base, see
++// packed_vbo_base) and each attribute's offset is taken from there.
+ #define handle_packed_vbo_attrib() \
+ 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
+-		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx]; \
++		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - vbo_base; \
+ 	} else { \
+ 		disable_draw_attrib(i) \
+-	}	
++	}
++
++#define packed_vbo_base(base) \
++	uint32_t base = 0xFFFFFFFF; \
++	for (int _i = 0; _i < p->attr_num; _i++) { \
++		uint8_t _a = p->attr_map[_i]; \
++		if ((cur_vao->vertex_attrib_state & (1 << _a)) && cur_vao->vertex_attrib_offsets[_a] < base) { \
++			base = cur_vao->vertex_attrib_offsets[_a]; \
++		} \
++	} \
++	if (base == 0xFFFFFFFF) { \
++		base = 0; \
++	}
+ 
+ #define handle_packed_attrib() \
+ 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
+@@ -1064,7 +1080,8 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
+ 	// Gathering real attribute data pointers
+ 	if (is_packed) {
+ 		if (target_vbo) {
+-			ptrs[0] = (void *)target_vbo->ptr + lowest * streams[0].stride;
++			packed_vbo_base(vbo_base)
++			ptrs[0] = (void *)target_vbo->ptr + vbo_base + lowest * streams[0].stride;
+ 			target_vbo->last_frame = vgl_framecount;
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -1332,7 +1349,8 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ 	// Gathering real attribute data pointers
+ 	if (is_packed) {
+ 		if (target_vbo) {
+-			ptrs[0] = (void *)target_vbo->ptr + first * streams[0].stride;
++			packed_vbo_base(vbo_base)
++			ptrs[0] = (void *)target_vbo->ptr + vbo_base + first * streams[0].stride;
+ 			target_vbo->last_frame = vgl_framecount;
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+@@ -1682,7 +1700,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 	// Gathering real attribute data pointers
+ 	if (is_packed) {
+ 		if (target_vbo) {
+-			ptrs[0] = (void *)target_vbo->ptr;
++			packed_vbo_base(vbo_base)
++			ptrs[0] = (void *)target_vbo->ptr + vbo_base;
+ 			target_vbo->last_frame = vgl_framecount;
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];

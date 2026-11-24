@@ -107,6 +107,22 @@ struct F {
     double value() const { return to_double(bits); }
 };
 
+// PlayStation Vita, [race] physics = fast: inside a HostMathScope (the race's vehicle step) the operators below run in the
+// FPU, which the scope sets to round toward zero and flush denormals: the EE's chopped add, subtract and multiply but for
+// the adder's dropped bits and the multiplier's lost carry (now and then one ulp apart), the divider's and square root's
+// chopped results where the EE's are now and then one above. Operands at exponent 255 (the EE's range past IEEE's),
+// division by zero and results past the largest take the EE's rules. Outside a scope, or with the setting off, every
+// result is the EE's bit for bit. The disc's recorded demonstrations (and replays of exact races) can drift with it on.
+#if defined(__vita__)
+#define GT3R_EE_HOST_MATH 1
+inline bool g_host_math = false; // (the main thread's: the race steps there)
+// Unlikely to the compiler, which then lays the FPU paths out of the EE paths' way: inline on the likely side they made
+// exact steps ~10% slower (the code in between, the instruction cache).
+#define GT3R_EE_HOST_ON() __builtin_expect(g_host_math, 0)
+#else
+#define GT3R_EE_HOST_MATH 0
+#endif
+
 // Inline fast paths of add / sub / mul (no flags), divide, square root, compare and the int conversions, for ports that
 // run every frame: the same results as the functions above (tests/test_ee_float.cpp checks them against each other).
 #if defined(_MSC_VER)
@@ -191,12 +207,43 @@ GT3R_EE_INLINE s32 key(u32 x) {
     const s32 m = s32(x & 0x7FFFFFFFu);
     return (x & 0x80000000u) ? -m : m;
 }
+#if GT3R_EE_HOST_MATH
+// g_host_math's operands: both inside IEEE's range (exponent below 255).
+GT3R_EE_INLINE bool host_ok(u32 a, u32 b) { return ((a >> 23) & 0xFF) != 0xFF && ((b >> 23) & 0xFF) != 0xFF; }
+// An FPU result past the largest (infinity) as the EE's +-max.
+GT3R_EE_INLINE u32 host_result(float r) {
+    const u32 b = bits(r);
+    return ((b >> 23) & 0xFF) == 0xFF ? (b & 0x80000000u) | 0x7FFFFFFFu : b;
+}
+#endif
 } // namespace fast
 
-GT3R_EE_INLINE F operator+(F a, F b) { return F::raw(fast::add(a.bits, b.bits)); }
-GT3R_EE_INLINE F operator-(F a, F b) { return F::raw(fast::add(a.bits, neg(b.bits))); }
-GT3R_EE_INLINE F operator*(F a, F b) { return F::raw(fast::mul(a.bits, b.bits)); }
-GT3R_EE_INLINE F operator/(F a, F b) { return F::raw(fast::div(a.bits, b.bits)); }
+GT3R_EE_INLINE F operator+(F a, F b) {
+#if GT3R_EE_HOST_MATH
+    if (GT3R_EE_HOST_ON() && fast::host_ok(a.bits, b.bits)) return F::raw(fast::host_result(fast::host(a.bits) + fast::host(b.bits)));
+#endif
+    return F::raw(fast::add(a.bits, b.bits));
+}
+GT3R_EE_INLINE F operator-(F a, F b) {
+#if GT3R_EE_HOST_MATH
+    if (GT3R_EE_HOST_ON() && fast::host_ok(a.bits, b.bits)) return F::raw(fast::host_result(fast::host(a.bits) - fast::host(b.bits)));
+#endif
+    return F::raw(fast::add(a.bits, neg(b.bits)));
+}
+GT3R_EE_INLINE F operator*(F a, F b) {
+#if GT3R_EE_HOST_MATH
+    if (GT3R_EE_HOST_ON() && fast::host_ok(a.bits, b.bits)) return F::raw(fast::host_result(fast::host(a.bits) * fast::host(b.bits)));
+#endif
+    return F::raw(fast::mul(a.bits, b.bits));
+}
+GT3R_EE_INLINE F operator/(F a, F b) {
+#if GT3R_EE_HOST_MATH
+    // (A divisor at exponent 0 is zero: the EE's +-max, below.)
+    if (GT3R_EE_HOST_ON() && fast::host_ok(a.bits, b.bits) && ((b.bits >> 23) & 0xFF) != 0)
+        return F::raw(fast::host_result(fast::host(a.bits) / fast::host(b.bits)));
+#endif
+    return F::raw(fast::div(a.bits, b.bits));
+}
 inline F operator-(F a) { return F::raw(neg(a.bits)); }
 inline F& operator+=(F& a, F b) { return a = a + b; }
 inline F& operator-=(F& a, F b) { return a = a - b; }
@@ -208,8 +255,19 @@ GT3R_EE_INLINE bool operator<=(F a, F b) { return fast::key(a.bits) <= fast::key
 GT3R_EE_INLINE bool operator>(F a, F b) { return fast::key(a.bits) > fast::key(b.bits); }
 GT3R_EE_INLINE bool operator>=(F a, F b) { return fast::key(a.bits) >= fast::key(b.bits); }
 inline F abs(F a) { return F::raw(abs(a.bits)); }
-GT3R_EE_INLINE F sqrt(F a) { return F::raw(fast::sqrt(a.bits)); } // sqrt(|a|)
-inline F rsqrt(F a, F b) { return F::raw(rsqrt(a.bits, b.bits)); } // a / sqrt(|b|)
+GT3R_EE_INLINE F sqrt(F a) { // sqrt(|a|)
+#if GT3R_EE_HOST_MATH
+    if (GT3R_EE_HOST_ON() && fast::host_ok(a.bits, 0)) return F::raw(fast::bits(__builtin_sqrtf(std::fabs(fast::host(a.bits)))));
+#endif
+    return F::raw(fast::sqrt(a.bits));
+}
+inline F rsqrt(F a, F b) { // a / sqrt(|b|)
+#if GT3R_EE_HOST_MATH
+    if (GT3R_EE_HOST_ON() && fast::host_ok(a.bits, b.bits) && ((b.bits >> 23) & 0xFF) != 0)
+        return F::raw(fast::host_result(fast::host(a.bits) / __builtin_sqrtf(std::fabs(fast::host(b.bits)))));
+#endif
+    return F::raw(rsqrt(a.bits, b.bits));
+}
 // The PS2's multiply-add: the product rounded first (an overflowed one, +-max, is the result).
 GT3R_EE_INLINE F madd(F acc, F b, F c) {
     const F p = b * c;
@@ -223,6 +281,32 @@ inline F max(F a, F b) { return a >= b ? a : b; }
 inline F min(F a, F b) { return a <= b ? a : b; }
 GT3R_EE_INLINE s32 to_int(F a) { return fast::to_int(a.bits); }        // truncates, saturates
 GT3R_EE_INLINE F int_to_f(s32 v) { return F::raw(fast::from_int(v)); } // chopped to 24 bits
+
+#if GT3R_EE_HOST_MATH
+// While alive (and `on`): the FPU rounds toward zero and flushes denormals to zero (FPSCR RMode and FZ), and the F
+// operators use it (g_host_math). The race's vehicle step only, on its thread. The FPU's own state comes back after.
+class HostMathScope {
+public:
+    explicit HostMathScope(bool on) : on_(on) {
+        if (!on_) return;
+        asm volatile("vmrs %0, fpscr" : "=r"(saved_) : : "memory");
+        const u32 v = (saved_ & ~(3u << 22)) | (3u << 22) | (1u << 24); // RMode = round toward zero, FZ
+        asm volatile("vmsr fpscr, %0" : : "r"(v) : "memory");
+        g_host_math = true;
+    }
+    ~HostMathScope() {
+        if (!on_) return;
+        g_host_math = false;
+        asm volatile("vmsr fpscr, %0" : : "r"(saved_) : "memory");
+    }
+    HostMathScope(const HostMathScope&) = delete;
+    HostMathScope& operator=(const HostMathScope&) = delete;
+
+private:
+    bool on_;
+    u32 saved_ = 0;
+};
+#endif
 
 // The sign of a side test (a (b - c)) - (d (e - f)), computed in this order (subtract, multiply, multiply, subtract),
 // told without computing it where it is certain, so a port can leave out a test that cannot pass (the outcome is the same;

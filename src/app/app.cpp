@@ -1,3 +1,4 @@
+#include "base/prof.h"
 #include "app/app.h"
 #include "base/hitch.h"
 #include "app/button_prompts.h"
@@ -30,6 +31,11 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
+#if defined(__vita__)
+#include <malloc.h> // (mallinfo: the PERF lines' heap)
+#endif
+#include <string_view>
 
 namespace gt3r {
 
@@ -123,6 +129,12 @@ bool App::init(int argc, char** argv) {
         SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, InputManager::xbox_rawinput(cfg ? *cfg : IniDocument{}) ? "1" : "0");
     }
 #endif
+#if defined(SDL_PLATFORM_VITA)
+    // SDL's quick checks only (NULL and the like), not its full object validation: every SDL call
+    // looked its objects up in a locked hash table, which the HUD's hundreds of 2D draws a frame,
+    // the gamepad reads and the audio streams paid for on the Vita's slow cores.
+    SDL_SetHint(SDL_HINT_INVALID_PARAM_CHECKS, "1");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK | SDL_INIT_SENSOR)) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -158,6 +170,11 @@ bool App::init(int argc, char** argv) {
     SDL_WindowFlags win_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_VITA)
     win_flags |= SDL_WINDOW_FULLSCREEN; // immersive: hide system bars (the Vita: the whole screen)
+#endif
+#if defined(SDL_PLATFORM_VITA)
+    // An OpenGL window from the start: SDL's GLES2 renderer would otherwise recreate it, and the
+    // Vita has exactly one.
+    win_flags |= SDL_WINDOW_OPENGL;
 #endif
 #if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_VITA)
     // [video] fullscreen = on | off (desktop; F11 and the Settings screen change it)
@@ -213,9 +230,10 @@ bool App::init(int argc, char** argv) {
             render_scale = platform::parse_render_scale(argv[++i]), render_scale_arg_ = true;
     }
 #if defined(SDL_PLATFORM_VITA)
-    // No 3D device for the Vita yet (SDL_GPU has no backend there; docs/dev/VITA.md): the menus
-    // on SDL's own 2D renderer (vitagxm).
-    use_gpu = false;
+    // The OpenGL ES device on vitaGL, through SDL's vitaGL backend (docs/dev/VITA.md): first, as
+    // SDL_GPU has no Vita backend; no multisampled renderbuffers (vitaGL has none).
+    gpu_opts.gles = true;
+    gpu_opts.msaa = 1;
 #endif
     int win_pw = 0, win_ph = 0;
     SDL_GetWindowSizeInPixels(window_, &win_pw, &win_ph);
@@ -265,7 +283,7 @@ bool App::init(int argc, char** argv) {
     }
     layout_ui(false);
     LOG_INFO("Renderer: %s", SDL_GetRendererName(renderer_));
-    if (limit_60fps()) apply_frame_limit();
+    apply_frame_limit(); // ([video] fps_lock)
     ui_ = std::make_unique<Ui>(renderer_);
 
     input_ = std::make_unique<InputManager>();
@@ -528,9 +546,11 @@ void App::set_fullscreen(bool on) {
     save_config();
 }
 
-// [video] limit_60fps: on high-refresh displays, draw every Nth refresh (120 Hz -> 60 fps,
-// 144 -> 72, 240 -> 60; 60 and 90 Hz -> every refresh) as SDL's main loop rate (SDL's renderers
-// only offer vsync on or off), which with vsync still presents on a refresh.
+// [video] fps_lock (limit_60fps = on: 60): draw every Nth display refresh, N the refreshes in
+// one frame of the limit (60 on 120 Hz -> every 2nd, on 144 Hz -> 72 fps; 30 on 60 Hz -> every
+// 2nd), as SDL's main loop rate (SDL's renderers only offer vsync on or off), which with vsync
+// still presents on a refresh. With vsync and a limit of every refresh, vsync alone paces. Without
+// a display rate, the limit itself.
 void App::apply_frame_limit() {
 #if GT3R_XR
     // A headset paces the frames (Session::begin_frame): a main loop rate under its refresh (60
@@ -539,23 +559,137 @@ void App::apply_frame_limit() {
 #endif
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
     const double hz = mode ? mode->refresh_rate : 0;
-    if (hz <= 0) return;
-    const int interval = limit_60fps() ? std::max(1, int(std::floor(hz / 60.0 + 0.25))) : 1;
-    const double rate = interval > 1 ? hz / interval : 0; // 0: as fast as vsync allows
+    int vsync = 0;
+    const bool synced = renderer_ && SDL_GetRenderVSync(renderer_, &vsync) && vsync != 0;
+    const int target = fps_lock();
+    int interval = 1;
+    double rate = 0; // 0: as fast as vsync (or the machine) allows
+    if (target > 0) {
+        if (hz > 0) {
+            interval = std::max(1, int(std::floor(hz / target + 0.25)));
+            rate = hz / interval;
+            if (synced && interval == 1) rate = 0;
+        } else {
+            rate = target;
+        }
+    }
     if (rate == frame_limit_rate_) return;
     frame_limit_rate_ = rate;
     if (rate > 0) SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, std::to_string(rate).c_str());
     else SDL_ResetHint(SDL_HINT_MAIN_CALLBACK_RATE);
-    LOG_INFO("Display %.0f Hz: drawing every %s", hz,
-             interval == 1 ? "refresh" : (std::to_string(interval) + " refreshes").c_str());
+    if (rate > 0) LOG_INFO("Frame rate limit: %.0f fps (display %.0f Hz, vsync %s)", rate, hz, synced ? "on" : "off");
+    else LOG_INFO("Frame rate limit: none (display %.0f Hz, vsync %s)", hz, synced ? "on" : "off");
 }
 
 bool App::limit_60fps() const { return to_lower(config_.get("video", "limit_60fps").value_or("off")) == "on"; }
 
-void App::set_limit_60fps(bool on) {
-    config_.set("video", "limit_60fps", on ? "on" : "off");
+void App::set_limit_60fps(bool on) { set_fps_lock(on ? 60 : 0); }
+
+int App::fps_lock() const {
+    const std::string v = to_lower(config_.get("video", "fps_lock").value_or(""));
+    if (v.empty()) return limit_60fps() ? 60 : 0;
+    const int n = std::atoi(v.c_str());
+    return n >= 10 ? std::min(n, 240) : 0; // ("off": 0)
+}
+
+void App::set_fps_lock(int fps) {
+    config_.set("video", "fps_lock", fps > 0 ? std::to_string(fps) : "off");
+    config_.remove("video", "limit_60fps"); // (fps_lock took its place)
     save_config();
     apply_frame_limit();
+}
+
+namespace {
+// The [video] settings a performance profile sets, and each profile's values in that order. The
+// race reads them when it starts (RaceScreen::start; draw distance, scenery animation and the mirror every frame:
+// RaceScreen::read_live_settings), the 3D resolution changes at once.
+constexpr const char* kProfileKeys[] = {"full_car_detail", "showroom_wheels", "car_reflections", "car_shadows",
+                                        "depth_of_field",  "heat_haze",       "replay_vignette", "replay_trail",
+                                        "render_scale",    "dynamic_resolution", "draw_distance",
+                                        "scenery_animation", "rear_mirror", "color_grading", "car_detail"};
+constexpr size_t kProfileKeyCount = sizeof(kProfileKeys) / sizeof(kProfileKeys[0]);
+struct PerformanceProfile {
+    const char* name;
+    const char* desc;
+    const char* values[kProfileKeyCount];
+};
+constexpr PerformanceProfile kPerformanceProfiles[] = {
+    {"Quality", "Everything on: full car detail, showroom wheels, car reflections and shadows, every replay effect, "
+                "full 3D resolution and draw distance. For fast computers.",
+     {"on", "on", "on", "on", "high", "on", "on", "on", "auto", "off", "100", "full", "on", "on", "normal"}},
+    {"Balanced", "Simpler distant cars and race wheels, no car reflections; shadows and replay effects stay, the 3D "
+                 "resolution follows the GPU.",
+     {"off", "off", "off", "on", "standard", "off", "on", "on", "auto", "on", "100", "full", "on", "on", "normal"}},
+    {"Performance", "No reflections or replay effects, 75% 3D resolution, the far scenery a little closer in, the "
+                    "scenery's animations in steps. For phones and handhelds.",
+     {"off", "off", "off", "on", "off", "off", "off", "off", "0.75", "off", "75", "reduced", "on", "on", "normal"}},
+    {"Max performance", "The fewest draws: no car shadows either, 50% 3D resolution and half the draw distance (far "
+                        "scenery pops in), the scenery's animations in steps, no rear-view mirror or colour grading, simpler cars nearby. For the PlayStation Vita.",
+     {"off", "off", "off", "off", "off", "off", "off", "off", "0.5", "off", "50", "reduced", "off", "off", "low"}},
+};
+constexpr int kPerformanceProfileCount = int(sizeof(kPerformanceProfiles) / sizeof(kPerformanceProfiles[0]));
+
+// The default of a [video] setting the profiles change (the getters' and the race's).
+std::string video_default(std::string_view key) {
+    const bool low = platform::low_power();
+    if (key == "full_car_detail" || key == "showroom_wheels") return low ? "off" : "on";
+    if (key == "depth_of_field") return low ? "off" : "high";
+    if (key == "dynamic_resolution") return low ? "on" : "off";
+#if defined(SDL_PLATFORM_VITA)
+    if (key == "car_reflections") return "off"; // (six course passes and six GPU waits a frame: docs/dev/VITA.md)
+#endif
+    if (key == "car_reflections" || key == "car_shadows" || key == "replay_vignette" || key == "replay_trail")
+        return "on";
+    if (key == "heat_haze") return "off";
+    if (key == "render_scale") return "auto";
+    if (key == "draw_distance") return "100";
+    if (key == "scenery_animation") return "full";
+    if (key == "rear_mirror") return "on";
+    if (key == "color_grading") return "on";
+    if (key == "car_detail") return "normal";
+    return "";
+}
+
+// Whether a setting's value is a profile's (render scales as numbers: "0.50" is "0.5").
+bool profile_value_matches(std::string_view key, const std::string& have, const char* want) {
+    if (key == "render_scale") {
+        const std::optional<float> a = platform::parse_render_scale(have), b = platform::parse_render_scale(want);
+        return a.has_value() == b.has_value() && (!a || std::fabs(*a - *b) < 0.01f);
+    }
+    if (key == "draw_distance") return std::atoi(have.c_str()) == std::atoi(want);
+    return have == want;
+}
+} // namespace
+
+std::string App::video_setting(const char* key) const {
+    if (std::optional<std::string> v = config_.get("video", key)) return to_lower(*v);
+    return video_default(key);
+}
+
+int App::performance_profile_count() { return kPerformanceProfileCount; }
+const char* App::performance_profile_name(int i) {
+    return i >= 0 && i < kPerformanceProfileCount ? kPerformanceProfiles[i].name : "Custom";
+}
+const char* App::performance_profile_desc(int i) {
+    return i >= 0 && i < kPerformanceProfileCount ? kPerformanceProfiles[i].desc : "";
+}
+
+int App::performance_profile() const {
+    for (int i = 0; i < kPerformanceProfileCount; ++i) {
+        bool all = true;
+        for (size_t k = 0; k < kProfileKeyCount && all; ++k)
+            all = profile_value_matches(kProfileKeys[k], video_setting(kProfileKeys[k]), kPerformanceProfiles[i].values[k]);
+        if (all) return i;
+    }
+    return -1;
+}
+
+void App::set_performance_profile(int i) {
+    if (i < 0 || i >= kPerformanceProfileCount) return;
+    const PerformanceProfile& p = kPerformanceProfiles[i];
+    for (size_t k = 0; k < kProfileKeyCount; ++k) config_.set("video", kProfileKeys[k], p.values[k]);
+    LOG_INFO("Performance profile: %s", p.name);
+    apply_render_scale(); // (saves the config; the dynamic scale starts again with the profile's setting)
 }
 
 void App::set_show_fps(bool on) {
@@ -643,11 +777,11 @@ void App::set_aspect(platform::Aspect a) {
 }
 
 bool App::full_car_detail() const {
-    return to_lower(config_.get("video", "full_car_detail").value_or(platform::is_mobile() ? "off" : "on")) == "on";
+    return video_setting("full_car_detail") == "on";
 }
 
 std::string App::depth_of_field() const {
-    return to_lower(config_.get("video", "depth_of_field").value_or(platform::is_mobile() ? "off" : "high"));
+    return video_setting("depth_of_field");
 }
 
 bool App::sharp_menu_models() const {
@@ -667,11 +801,11 @@ SDL_Point App::menu_model_size() const {
 }
 
 bool App::showroom_wheels() const {
-    return to_lower(config_.get("video", "showroom_wheels").value_or(platform::is_mobile() ? "off" : "on")) == "on";
+    return video_setting("showroom_wheels") == "on";
 }
 
 bool App::dynamic_resolution() const {
-    return to_lower(config_.get("video", "dynamic_resolution").value_or(platform::is_mobile() ? "on" : "off")) == "on";
+    return video_setting("dynamic_resolution") == "on";
 }
 
 void App::set_dynamic_resolution(bool on) {
@@ -863,8 +997,8 @@ SDL_AppResult App::iterate() {
         }
     }
 
-    updates().poll(*this);
-    music_.poll();
+    { GT3R_PROF("app.updates_poll"); updates().poll(*this); }
+    { GT3R_PROF("app.music_poll"); music_.poll(); }
     apply_screen_changes();
     discord_status().frame(*this);
     Screen* top = screens_.empty() ? nullptr : screens_.back().get();
@@ -882,8 +1016,8 @@ SDL_AppResult App::iterate() {
     }
 #endif
     pointer_script();
-    touch_.update(dt, touch_layout, !modal && top && top->touch_fades(), *input_);
-    input_->update(dt);
+    { GT3R_PROF("app.touch_update"); touch_.update(dt, touch_layout, !modal && top && top->touch_fades(), *input_); }
+    { GT3R_PROF("app.input_update"); input_->update(dt); }
 #if GT3R_XR
     if (xr_)
         for (int p = 0; p < InputManager::kMaxPlayers; ++p)
@@ -913,17 +1047,20 @@ SDL_AppResult App::iterate() {
     if (xr_) SDL_SetRenderTarget(renderer_, xr_->canvas()); // the frame goes into the canvas
 #endif
     const Screen* shown = screens_.empty() ? nullptr : screens_.back().get(); // (after this frame's changes)
-    layout_ui(shown && shown->adaptive_ui(), shown && shown->follows_aspect());
+    { GT3R_PROF("app.layout_ui"); layout_ui(shown && shown->adaptive_ui(), shown && shown->follows_aspect()); }
     Ui::set_prompts(button_prompts(*input_, touch_.controls().visible(), touch_ui_)); // "{Cross}" in our hints
-    begin_gamma_frame();
+    { GT3R_PROF("app.gamma_begin"); begin_gamma_frame(); }
     ui_->clear();
     Uint64 h_r0 = SDL_GetTicksNS();
     if (!screens_.empty()) screens_.back()->render(*this, *ui_);
     updates().dialog_render(*ui_);
     Uint64 h_r1 = SDL_GetTicksNS();
     touch_.set_safe_area(safe_area_window());
-    touch_.render(*ui_);
-    draw_fps(shown && shown->adaptive_ui());
+    { GT3R_PROF("app.touch_render"); touch_.render(*ui_); }
+#if defined(SDL_PLATFORM_VITA)
+    vita_tab_render();
+#endif
+    { GT3R_PROF("app.draw_fps"); draw_fps(shown && shown->adaptive_ui()); }
     if (phone_sim_) draw_phone_mask();
     if (pointer_shown_) { // a scripted pointer's arrow (screenshots)
         const float x = pointer_x_, y = pointer_y_;
@@ -976,9 +1113,9 @@ SDL_AppResult App::iterate() {
         SDL_CreateDirectory(dir.c_str());
         save_screenshot(dir + "/gt3r-" + std::to_string(SDL_GetTicks()) + ".png");
     }
-    if (gamma_frame_) gamma_pass_->end(gamma_); // (after the screenshots: they keep GT3's colours)
+    if (gamma_frame_) { GT3R_PROF("app.gamma_end"); gamma_pass_->end(gamma_); } // (after the screenshots: they keep GT3's colours)
     const Uint64 present_start = SDL_GetTicksNS();
-    SDL_RenderPresent(renderer_);
+    { GT3R_PROF("app.render_present"); SDL_RenderPresent(renderer_); }
     if (gpu_) gpu_->frame_presented();
     const double present_ms = double(SDL_GetTicksNS() - present_start) / 1e6;
     // A lost GPU (Vulkan's VK_ERROR_DEVICE_LOST, which SDL only reports in its error text) never
@@ -1018,6 +1155,54 @@ SDL_AppResult App::iterate() {
                          hitch::ticks, hitch::ticks_ms, double(h_r1 - h_r0) / 1e6, hitch::env_ms, hitch::collect_ms,
                          hitch::draw_ms, double(h_end - h_r1) / 1e6, hitch::race_t, hitch::x, hitch::z, hitch::smoke, hitch::meshes);
         }
+#if defined(SDL_PLATFORM_VITA)
+        // PlayStation Vita (no environment to set GT3R_HITCH in): every 2 s the frame rate and where
+        // the frames' time went, averaged, to gt3r.log (docs/dev/VITA.md, performance).
+        if (h_prev_end) {
+            static double sum[9];
+            static int n = 0, ticks = 0, meshes = 0;
+            const double part[9] = {double(h_end - h_prev_end) / 1e6, double(h_u0 - h_prev_end) / 1e6,
+                                    double(h_u1 - h_u0) / 1e6, hitch::ticks_ms, double(h_r1 - h_r0) / 1e6,
+                                    hitch::env_ms, hitch::collect_ms, hitch::draw_ms, double(h_end - h_r1) / 1e6};
+            for (int i = 0; i < 9; ++i) sum[i] += part[i];
+            ticks += hitch::ticks, meshes = std::max(meshes, hitch::meshes), ++n;
+            hitch::ticks = hitch::meshes = 0; // (screens without them leave them unset)
+            hitch::ticks_ms = hitch::env_ms = hitch::collect_ms = hitch::draw_ms = 0;
+            if (sum[0] >= 2000) {
+                const double k = 1.0 / n;
+                LOG_INFO("PERF %.1f fps: frame %.1f ms (pre %.1f, update %.1f [%.1f ticks %.1f], render %.1f [env %.1f "
+                         "collect %.1f draw %.1f], present %.1f) meshes %d scale %d%%",
+                         1000.0 * n / sum[0], sum[0] * k, sum[1] * k, sum[2] * k, ticks * k, sum[3] * k, sum[4] * k,
+                         sum[5] * k, sum[6] * k, sum[7] * k, sum[8] * k, meshes,
+                         int(std::lround((gpu_ ? gpu_->render_scale() : 1.0f) * 100)));
+                // The GT3R_PROF sections (base/prof.h), ms a frame and calls a frame, the largest
+                // first; the audio thread's mixing as a share of the wall clock.
+                int order[prof::kSlots];
+                for (int i = 0; i < prof::used; ++i) order[i] = i;
+                std::sort(order, order + prof::used, [](int a, int b) { return prof::slots[a].ms > prof::slots[b].ms; });
+                std::string sections;
+                for (int j = 0; j < prof::used; ++j) {
+                    prof::Slot& s = prof::slots[order[j]];
+                    if (s.ms * k < 0.3) continue;
+                    char item[96];
+                    std::snprintf(item, sizeof item, " %s %.1f", s.name, s.ms * k);
+                    sections += item;
+                    if (s.calls > n) {
+                        std::snprintf(item, sizeof item, "(x%.0f)", double(s.calls) * k);
+                        sections += item;
+                    }
+                }
+                for (int i = 0; i < prof::used; ++i) prof::slots[i].ms = 0, prof::slots[i].calls = 0;
+                const double audio = double(prof::audio_ns.exchange(0)) / 1e6;
+                // newlib's heap (256 MB, vita_process.cpp): in use, and taken from the system so far.
+                const struct mallinfo mi = mallinfo();
+                LOG_INFO("PERF sections (ms a frame):%s; audio thread %.0f%%; heap %.1f MB used of %.1f MB", sections.c_str(),
+                         100.0 * audio / sum[0], double(mi.uordblks) / 1048576.0, double(mi.arena) / 1048576.0);
+                for (double& s : sum) s = 0;
+                n = ticks = meshes = 0;
+            }
+        }
+#endif
         h_prev_end = h_end;
     }
     return quit_ ? SDL_APP_SUCCESS : SDL_APP_CONTINUE;
@@ -1032,6 +1217,7 @@ void App::idle_cursor(Uint64 now) {
 }
 
 SDL_AppResult App::event(const SDL_Event& e) {
+    GT3R_PROF("app.event");
     if (e.type == SDL_EVENT_QUIT) return SDL_APP_SUCCESS;
     // Android may end a backgrounded app without a quit.
     if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND || e.type == SDL_EVENT_TERMINATING) remember_race_scale();
@@ -1063,7 +1249,7 @@ SDL_AppResult App::event(const SDL_Event& e) {
             save_config();
         }
     }
-    if (e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED && limit_60fps()) apply_frame_limit(); // another refresh rate
+    if (e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED && fps_lock() > 0) apply_frame_limit(); // another refresh rate
     // Songs copied in while the game was away (the Files app on phones), and music access
     // allowed or taken back in Android's settings meanwhile.
     if (e.type == SDL_EVENT_DID_ENTER_FOREGROUND) {
@@ -1085,10 +1271,75 @@ SDL_AppResult App::event(const SDL_Event& e) {
         updates().dialog_event(*this, local);
         return SDL_APP_CONTINUE;
     }
+#if defined(SDL_PLATFORM_VITA)
+    if (vita_tab_event(local)) return SDL_APP_CONTINUE; // a tap on the Settings tab
+#endif
     if (touch_.event(local)) return SDL_APP_CONTINUE; // a touch on the on-screen controls
     if (!screens_.empty()) screens_.back()->on_event(*this, local);
     return SDL_APP_CONTINUE;
 }
+
+#if defined(SDL_PLATFORM_VITA)
+namespace {
+constexpr Uint64 kVitaTabShowNs = 3'000'000'000ull; // shown this long after the last touch
+constexpr Uint64 kVitaTabFadeNs = 500'000'000ull;   // the last part of it fading out
+constexpr const char* kVitaTabLabel = "Settings";
+} // namespace
+
+UiRect App::vita_tab_rect() const {
+    const UiRect& s = ui_->safe();
+    const float w = Ui::text_width(kVitaTabLabel) + 24, h = 22;
+    return {s.right() - w - 8, s.y + 8, w, h};
+}
+
+bool App::vita_settings_open() const {
+    if (!vita_settings_) return false;
+    for (const auto& s : screens_)
+        if (s.get() == vita_settings_) return true;
+    for (const auto& s : pending_)
+        if (s.get() == vita_settings_) return true;
+    return false;
+}
+
+bool App::vita_tab_event(const SDL_Event& e) {
+    const bool touch_mouse_down = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.which == SDL_TOUCH_MOUSEID;
+    const bool touch_mouse_other = (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.which == SDL_TOUCH_MOUSEID) ||
+                                   (e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which == SDL_TOUCH_MOUSEID);
+    if (vita_tab_held_) { // the tapping finger's moves and lift, and SDL's mouse made from it
+        if (e.type == SDL_EVENT_FINGER_UP) vita_tab_held_ = false;
+        if (e.type == SDL_EVENT_FINGER_MOTION || e.type == SDL_EVENT_FINGER_UP || touch_mouse_other) return true;
+    }
+    if (e.type != SDL_EVENT_FINGER_DOWN && !touch_mouse_down) return false;
+    const Uint64 now = SDL_GetTicksNS();
+    const float x = e.type == SDL_EVENT_FINGER_DOWN ? e.tfinger.x : e.button.x;
+    const float y = e.type == SDL_EVENT_FINGER_DOWN ? e.tfinger.y : e.button.y;
+    const bool shown = now < vita_tab_until_ns_ && !vita_settings_open();
+    if (shown && vita_tab_rect().contains(x, y)) {
+        if (e.type == SDL_EVENT_FINGER_DOWN) {
+            vita_tab_held_ = true;
+            vita_tab_until_ns_ = 0;
+            std::unique_ptr<Screen> settings = make_settings_screen();
+            vita_settings_ = settings.get();
+            push(std::move(settings));
+        }
+        return true; // not passed on: the screen under the tab never sees it
+    }
+    vita_tab_until_ns_ = now + kVitaTabShowNs; // any other touch shows the tab, and goes on to the screen
+    return false;
+}
+
+void App::vita_tab_render() {
+    const Uint64 now = SDL_GetTicksNS();
+    if (now >= vita_tab_until_ns_ || vita_settings_open()) return;
+    const Uint64 left = vita_tab_until_ns_ - now;
+    const float a = left >= kVitaTabFadeNs ? 1.0f : float(left) / float(kVitaTabFadeNs);
+    const auto alpha = [a](Color c, float k) { return Color{c.r, c.g, c.b, u8(std::lround(255.0f * k * a))}; };
+    const UiRect r = vita_tab_rect();
+    ui_->fill_round(r.x, r.y, r.w, r.h, r.h / 2, alpha(colors::kPanel, 0.85f));
+    ui_->frame_round(r.x, r.y, r.w, r.h, r.h / 2, 1, alpha(colors::kAccent, 1.0f));
+    ui_->text_center_in(r.x, r.w, std::floor(r.y + (r.h - Ui::kChar) / 2), kVitaTabLabel, alpha(colors::kText, 1.0f));
+}
+#endif
 
 SDL_FRect App::safe_area_window() const {
     int ww = 0, wh = 0;

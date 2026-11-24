@@ -118,6 +118,9 @@ struct ShaderCode {
     const unsigned char* spv;
     size_t spv_size;
     const char *msl, *gles, *gles_blocks, *gles_samplers;
+    // Vertex attribute names in location order, bound before the link: the Vita's Cg shaders
+    // (render/shaders/vita_cg.h), whose attributes have no layout locations. Null: none to bind.
+    const char* gles_attributes = nullptr;
 };
 #define GT3R_SHADER_CODE(n)                                                                                      \
     ::gt3r::render::ShaderCode {                                                                                 \
@@ -150,7 +153,14 @@ public:
     SDL_GPUTextureFormat depth_format() const { return depth_format_; }
     SDL_GPUSampleCount sample_count() const { return samples_; }
     // The SPIN_COPIES shader variants were created (PipelineKey::spin_copy).
+#if GT3R_VITA
+    // Not on the Vita: its Cg has no SPIN_COPIES variant (render/shaders/vita_cg.h), and vitaGL fetches
+    // every vertex stream of an instanced draw by the instance index when no attribute has a divisor,
+    // which drew the rims' copies as shards about the wheels. One copy, an ordinary draw.
+    bool spin_copies() const { return false; }
+#else
     bool spin_copies() const { return vs_copy_ && fs_copy_; }
+#endif
     int msaa() const { return 1 << int(samples_); }
     // The MSAA levels the GPU draws the 3D pass with (1 = off), lowest first.
     std::vector<int> msaa_levels() const;
@@ -335,6 +345,7 @@ private:
     u32 stage(const void* data, u32 size);
     SDL_GPUDevice* device_;
     std::vector<Pending> pending_;
+    std::vector<SDL_GPUTexture*> gpu_mips_; // update_rgba's textures whose levels the GPU makes (the Vita)
     // Every upload's data, copied into a single transfer buffer at submit(): SDL's Vulkan
     // backend gives each transfer buffer its own device memory allocation.
     std::vector<u8> staging_;

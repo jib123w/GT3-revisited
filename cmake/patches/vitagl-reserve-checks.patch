@@ -1,0 +1,89 @@
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index dd6ad90..a5ac7ca 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -1002,13 +1002,16 @@ void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLin
+ 		texcoord.w = (DISPLAY_HEIGHT_FLOAT - (float)srcY0) / DISPLAY_HEIGHT_FLOAT;
+ 	}
+ 
+-	void *vertex_buffer;
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
+-	vglSetUniformData((uint8_t *)vertex_buffer + blit_position_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, &position.x, SCE_GXM_PARAMETER_TYPE_F32);
+-	vglSetUniformData((uint8_t *)vertex_buffer + blit_texcoord_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, &texcoord.x, SCE_GXM_PARAMETER_TYPE_F32);
++	void *vertex_buffer = NULL;
++	if (sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer) < 0 || !vertex_buffer) {
++		vgl_log("%s:%d %s: no scene to reserve uniforms in (sceGxmBeginScene failed?): draw skipped.\n", __FILE__, __LINE__, __func__);
++	} else {
++		vglSetUniformData((uint8_t *)vertex_buffer + blit_position_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, &position.x, SCE_GXM_PARAMETER_TYPE_F32);
++		vglSetUniformData((uint8_t *)vertex_buffer + blit_texcoord_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, &texcoord.x, SCE_GXM_PARAMETER_TYPE_F32);
+ 
+-	// Draw read framebuffer on top of write framebuffer
+-	sceGxmDrawPrecomputed(gxm_context, &blit_draw_state);
++		// Draw read framebuffer on top of write framebuffer
++		sceGxmDrawPrecomputed(gxm_context, &blit_draw_state);
++	}
+ 
+ 	// Restore all invalidated configurations
+ 	if (readFramebuffer) {
+diff --git a/source/misc.c b/source/misc.c
+index 658a6e4..66a4b2e 100644
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -686,12 +686,16 @@ void glClear(GLbitfield mask) {
+ 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);
+ 	sceGxmSetFragmentProgram(gxm_context, is_fbo_float ? clear_fragment_program_float_patched : clear_fragment_program_patched);
+ 
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer);
+-	sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
+-	sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
+-
+-	sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &fbuffer);
+-	sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
++	vbuffer = fbuffer = NULL;
++	const GLboolean reserved = sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer) >= 0 && vbuffer &&
++		sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &fbuffer) >= 0 && fbuffer;
++	if (reserved) {
++		sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
++		sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
++		sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
++	} else {
++		vgl_log("%s:%d %s: no scene to reserve uniforms in (sceGxmBeginScene failed?): draw skipped.\n", __FILE__, __LINE__, __func__);
++	}
+ 
+ 	// Disable fragment program if not clearing color buffer. Depth and stencil clears are unaffected.
+ 	if (!(mask & GL_COLOR_BUFFER_BIT)) {
+@@ -730,7 +734,8 @@ void glClear(GLbitfield mask) {
+ 		sceGxmSetBackStencilRef(gxm_context, stencil_value & 0xFF);
+ 	}
+ 
+-	sceGxmDrawPrecomputed(gxm_context, &clear_draw_state);
++	if (reserved)
++		sceGxmDrawPrecomputed(gxm_context, &clear_draw_state);
+ 
+ 	validate_depth_test();
+ 	change_depth_write((depth_mask_state && depth_test_state) ? SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED);
+diff --git a/source/tests.c b/source/tests.c
+index 454ec48..0498bac 100644
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -343,12 +343,15 @@ void update_scissor_test() {
+ 		SCE_GXM_STENCIL_OP_KEEP,
+ 		0, 0);
+ 
+-	void *vertex_buffer;
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
+-	vglSetUniformData((uint8_t *)vertex_buffer + clear_position_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x, SCE_GXM_PARAMETER_TYPE_F32);
+-	vglSetUniformData((uint8_t *)vertex_buffer + clear_depth_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 1, &scissor_depth, SCE_GXM_PARAMETER_TYPE_F32);
++	void *vertex_buffer = NULL;
++	if (sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer) < 0 || !vertex_buffer) {
++		vgl_log("%s:%d %s: no scene to reserve uniforms in (sceGxmBeginScene failed?): draw skipped.\n", __FILE__, __LINE__, __func__);
++	} else {
++		vglSetUniformData((uint8_t *)vertex_buffer + clear_position_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x, SCE_GXM_PARAMETER_TYPE_F32);
++		vglSetUniformData((uint8_t *)vertex_buffer + clear_depth_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 1, &scissor_depth, SCE_GXM_PARAMETER_TYPE_F32);
+ 
+-	sceGxmDrawPrecomputed(gxm_context, &clear_draw_state);
++		sceGxmDrawPrecomputed(gxm_context, &clear_draw_state);
++	}
+ 
+ 	// Restoring viewport and culling
+ 	validate_viewport();
