@@ -97,6 +97,7 @@ RaceScreen::RaceScreen(const OnlineLaunch& l) : preset_(read_preset()) {
 }
 
 RaceScreen::~RaceScreen() {
+    join_async_ticks(); // (before any member it steps goes)
     if (loading_own_) SDL_DestroyTexture(loading_own_);
     if (!app_) return;
     app_->remember_race_scale();

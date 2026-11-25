@@ -2,6 +2,7 @@
 #include "audio/audio_engine.h"
 
 #include "audio/music_file.h"
+#include "audio/prefetch_music.h"
 #include "base/config.h"
 #include "base/log.h"
 #include "vfs/vfs.h"
@@ -421,6 +422,12 @@ void AudioEngine::start_stream(std::unique_ptr<MusicStream> stream, std::shared_
                                bool resume, const std::string& what, float trim) {
     sequencer_.stop(voices_);
     replaced_sequence_ = -1;
+#if defined(__vita__)
+    // Decoded ahead on the third core (audio/prefetch_music.h): the audio thread, busy mixing a race, only copies
+    // (the disc's music streams from the disc image: its reads crackled the music there).
+    stream = std::make_unique<PrefetchMusic>(std::move(stream), 2);
+#endif
+    std::unique_ptr<MusicStream> old; // (the piece before goes once the locks are let go: its decoder joins)
     const u32 rate = stream->sample_rate(), channels = stream->channels();
     SDL_AudioSpec in{SDL_AUDIO_S16, int(channels), int(rate)};
     const double length = rate ? double(stream->total_frames()) / rate : 0.0;
@@ -433,6 +440,7 @@ void AudioEngine::start_stream(std::unique_ptr<MusicStream> stream, std::shared_
         SDL_ClearAudioStream(music_stream_);
         SDL_SetAudioStreamFormat(music_stream_, &in, nullptr);
         music_length_ = length;
+        old = std::move(music_);
         music_ = std::move(stream);
         music_data_ = std::move(data);
         music_finished_ = false;
@@ -442,6 +450,7 @@ void AudioEngine::start_stream(std::unique_ptr<MusicStream> stream, std::shared_
         stream_trim_ = trim;
     }
     SDL_UnlockAudioStream(music_stream_);
+    old.reset();
     SDL_SetAudioStreamGain(music_stream_, stream_output_gain(volume, music_volume_) * trim);
     // A new piece plays at once: a pause (the race pause) ends with the piece it paused.
     // Without this, leaving a race from its pause menu left the device paused and the
@@ -462,9 +471,11 @@ void AudioEngine::stop_stream() {
     replaced_sequence_ = -1;
     // Same lock order as play_stream(): stream, then mutex_, and the device call unlocked.
     if (music_stream_) SDL_LockAudioStream(music_stream_);
+    std::unique_ptr<MusicStream> old; // (gone once the locks are let go: a decoder thread joins; still before return,
+                                      // so before a disc that the piece reads from closes)
     {
         std::lock_guard lock(mutex_);
-        music_.reset();
+        old = std::move(music_);
         music_data_.reset();
         fed_at_ns_.store(0, std::memory_order_release);
         music_live_.store(false);

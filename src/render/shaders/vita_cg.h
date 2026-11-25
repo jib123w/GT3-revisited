@@ -474,10 +474,14 @@ float4 main(
     }
     return float4(rc, U_TINT.a);
 #else
+#ifndef NO_DISCARD
     if (v_fog.y > 0.0 || faded_out(frag.xy)) discard;
+#endif
     bool kill;
     float4 o = shade(v_normal, v_uv, v_color, v_world, v_lit, v_fog.x, face > 0.0, kill);
+#ifndef NO_DISCARD
     if (kill) discard;
+#endif
     // GT3's reflection map is a PSMCT16 frame buffer: each write keeps c8 >> 3.
     if (U_OUTPUT_MODE.x > 0.5) o.rgb = floor(saturate(o.rgb) * (255.0 / 8.0) + 1e-4) * (8.0 / 255.0);
     return o;

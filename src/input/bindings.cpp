@@ -872,11 +872,39 @@ std::optional<Profile>& PlayerBindings::slot(DeviceKind kind, bool race, Binding
     return (race ? controller_race : controller_menu)[controller_index(kind)];
 }
 
+#if defined(__vita__)
+namespace {
+// GT3 original on the Vita: the menu's buttons, but the handheld has no L2 / R2 for the gears (its L and R
+// are the menu's L1 / R1): what drives the menu's L1 / R1 shifts down / up, and Select changes the view
+// (R1's action), as Gran Turismo on the PSP. Looking back: the right stick (Look ahead / behind).
+Profile vita_gt3_race(const Profile& menu) {
+    Profile p = menu;
+    p.name = "gt3";
+    for (Binding& b : p.bindings) {
+        if (b.target.kind != PadTarget::Kind::Button) continue;
+        switch (b.target.button) {
+        case PadButton::L1: b.target.button = PadButton::L2; break;
+        case PadButton::R1: b.target.button = PadButton::R2; break;
+        case PadButton::Select: b.target.button = PadButton::R1; break;
+        default: break;
+        }
+    }
+    return p;
+}
+} // namespace
+#endif
+
 const Profile& PlayerBindings::set(DeviceKind kind, bool race, BindingSet s) const {
     static const Profile none;
     if (s == BindingSet::Controller && kind == DeviceKind::Keyboard) return none;
     const std::optional<Profile>& c = const_cast<PlayerBindings*>(this)->slot(kind, race, s);
     if (c && (race ? race_custom_on : menu_custom_on)) return *c;
+#if defined(__vita__)
+    if (race && race_layout == "gt3" && s == BindingSet::Controller) {
+        vita_gt3_race_ = vita_gt3_race(set(kind, false, s)); // (rebuilt each time: the menu's set may change)
+        return vita_gt3_race_;
+    }
+#endif
     if (race && race_layout == "gt3") return set(kind, false, s);
     return layout(kind, race, s, player2, vr_pad);
 }
@@ -920,7 +948,12 @@ void PlayerBindings::begin_custom(DeviceKind kind, bool race) {
     (race ? race_custom_on : menu_custom_on) = true;
 }
 
-bool PlayerBindings::race_reads_menu(DeviceKind kind) const { return race_layout == "gt3" && !custom(kind, true); }
+bool PlayerBindings::race_reads_menu(DeviceKind kind) const {
+#if defined(__vita__)
+    if (kind != DeviceKind::Keyboard) return false; // (GT3 original's own set there: vita_gt3_race)
+#endif
+    return race_layout == "gt3" && !custom(kind, true);
+}
 
 Profile PlayerBindings::combined(DeviceKind kind, bool race) const {
     Profile out;

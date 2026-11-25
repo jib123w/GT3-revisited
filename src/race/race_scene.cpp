@@ -1,5 +1,6 @@
 #include "race/race_scene.h"
 
+#include "base/async_job.h"
 #include "base/log.h"
 #include "base/prof.h"
 #include "formats/course/course_model.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <cmath>
 #include <cstdio>
 #include <optional>
@@ -66,9 +68,17 @@ render::Mat4 car_matrix(const sim::VehicleState& s) {
 
 namespace {
 float g_car_lod_scale = 1.0f; // (set_car_lod_scale: the main thread's)
+
+// The car loads' second decode (CarVisual's brake-lamp variant) runs here, on the third core: the main thread builds
+// one car at a time, so one thread does. Never destroyed (the process ends with it).
+AsyncJob& car_loader() {
+    static AsyncJob* const job = new AsyncJob(2);
+    return *job;
 }
+} // namespace
 
 void set_car_lod_scale(float scale) { g_car_lod_scale = std::clamp(scale, 0.1f, 1.0f); }
+float car_lod_scale() { return g_car_lod_scale; }
 
 int car_lod(float dist, int lods, bool full_detail) {
     if (full_detail) return 0;
@@ -254,15 +264,18 @@ void CourseScene::moving_worker() {
         job_->cv.wait(lock, [this] { return job_->pending || job_->quit; });
         if (job_->quit) return;
         job_->pending = false, job_->busy = true;
+        const size_t counts[2] = {job_->texture_count[0], job_->texture_count[1]};
         lock.unlock();
-        std::vector<scene::Mesh> out[2];
+        render::GpuModel::Assembled out[2];
         const Moving* moving[2] = {&scenery_moving_, &backdrop_moving_};
         for (int i = 0; i < 2; ++i) {
             if (!moving[i]->gpu) continue;
+            std::vector<scene::Mesh> meshes;
             for (const gtm1::AnimatedNodes& a : moving[i]->nodes) {
                 std::vector<scene::Mesh> part = a.meshes();
-                for (scene::Mesh& mesh : part) out[i].push_back(std::move(mesh));
+                for (scene::Mesh& mesh : part) meshes.push_back(std::move(mesh));
             }
+            out[i] = render::GpuModel::assemble_geometry(meshes, counts[i]); // (here too, not on the main thread)
         }
         lock.lock();
         job_->result[0] = std::move(out[0]), job_->result[1] = std::move(out[1]);
@@ -296,7 +309,8 @@ void CourseScene::upload_animations() {
     }
     // What the worker finished goes up; changed nodes start it again.
     bool took = false;
-    std::vector<scene::Mesh> result[2];
+    render::GpuModel::Assembled result[2];
+    Moving* moving[2] = {&scenery_moving_, &backdrop_moving_};
     {
         std::lock_guard lock(job_->mutex);
         if (job_->done) {
@@ -305,14 +319,14 @@ void CourseScene::upload_animations() {
         }
         if (moving_changed_ && !job_->pending && !job_->busy) {
             moving_changed_ = false;
+            for (int i = 0; i < 2; ++i) job_->texture_count[i] = moving[i]->gpu ? moving[i]->gpu->texture_count() : 0;
             job_->pending = true;
             job_->cv.notify_all();
         }
     }
     if (!took) return;
-    Moving* moving[2] = {&scenery_moving_, &backdrop_moving_};
     for (int i = 0; i < 2; ++i)
-        if (moving[i]->gpu) moving[i]->gpu->update_geometry(result[i]);
+        if (moving[i]->gpu) moving[i]->gpu->update_geometry(std::move(result[i]));
 #else
     if (!moving_changed_) return;
     moving_changed_ = false;
@@ -437,6 +451,30 @@ CarVisual::CarVisual(render::GpuContext& ctx, ByteSpan car_file, const std::stri
     opt.morphs = &morphs_;
     std::vector<gtm1::ClutSet> cluts;
     opt.clut_sets = &cluts;
+    // The brake-lamp variant (used below): the node programs' brake switch (selector id 0) takes its "pressed" branch
+    // (lit lens chunks with lamp materials). A second full decode of the car, independent of the first: on the loader
+    // thread (the third core) while this one decodes the body (each car took ~2 s of a race's load on the Vita).
+    CarModelOptions bo = opt;
+    bo.brake = true;
+    bo.wheels = false; // (so no stand-in rim: nothing reads the disc there)
+    bo.effects = false;
+    bo.clut_sets = nullptr;
+    std::vector<gtm1::MorphDraws> lit_morphs; // (left out as in body_; drawn from morphs_)
+    bo.morphs = &lit_morphs;
+    scene::Model lit;
+    std::exception_ptr lit_error;
+    AsyncJob& loader = car_loader();
+    loader.start([&] {
+        try {
+            lit = load_car_model(car_file, bo, model);
+        } catch (...) {
+            lit_error = std::current_exception();
+        }
+    });
+    struct JoinLoader { // (whatever happens here, the decode is done before its locals go)
+        AsyncJob& job;
+        ~JoinLoader() { job.join(); }
+    } join_loader{loader};
     scene::Model car = load_car_model(car_file, opt, model);
     opt.clut_sets = nullptr; // (the other builds below: none)
     for (const scene::Mesh& m : car.meshes) lods_ = std::max(lods_, m.lod + 1);
@@ -506,15 +544,9 @@ CarVisual::CarVisual(render::GpuContext& ctx, ByteSpan car_file, const std::stri
     } catch (const std::exception&) {
     }
     {
-        // The brake-lamp variant: the node programs' brake switch (selector id 0) takes its
-        // "pressed" branch (lit lens chunks with lamp materials).
-        CarModelOptions bo = opt;
-        bo.brake = true;
-        bo.wheels = false;
-        bo.effects = false;
-        std::vector<gtm1::MorphDraws> lit_morphs; // (left out as in body_; drawn from morphs_)
-        bo.morphs = &lit_morphs;
-        scene::Model lit = load_car_model(car_file, bo, model);
+        // The brake-lamp variant, decoded on the loader thread meanwhile (above).
+        loader.join();
+        if (lit_error) std::rethrow_exception(lit_error);
         scene::Model lit_body = scene::extract(lit, [](const scene::Mesh& m) { return m.name.rfind("node", 0) != 0; });
         if (!lit_body.meshes.empty()) body_brake_ = std::make_unique<render::GpuModel>(ctx, lit_body);
     }

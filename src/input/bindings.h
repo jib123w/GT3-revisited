@@ -227,6 +227,9 @@ struct PlayerBindings {
     bool race_custom_on = true, menu_custom_on = true; // [playerN] race_custom / menu_custom
     bool player2 = false; // the keyboard's layout around I / J / K / L, apart from player 1's
     bool vr_pad = false;  // the pad is the VR controllers: its menu layout is "quest"
+#if defined(__vita__)
+    mutable Profile vita_gt3_race_; // GT3 original's race set on the Vita (set(): L / R shift, Select the view)
+#endif
 
     const Profile& set(DeviceKind kind, bool race, BindingSet s) const;
     bool has_custom(DeviceKind kind, bool race) const; // custom sets kept (either set)

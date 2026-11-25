@@ -1,7 +1,15 @@
 #include "audio/voice_mixer.h"
 
+#include "base/prof.h"
+
+#include <SDL3/SDL_properties.h>
+
 #include <algorithm>
 #include <cmath>
+
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
 
 namespace gt3r {
 
@@ -89,6 +97,31 @@ constexpr s16 kGauss[512] = {
 VoiceMixer::VoiceMixer() {
     for (auto& v : voices_) v.gen = 1;
     changes_.reserve(64);
+#if defined(__vita__)
+    helper_go_ = SDL_CreateSemaphore(0);
+    helper_done_ = SDL_CreateSemaphore(0);
+    if (helper_go_ && helper_done_) {
+        const SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, reinterpret_cast<void*>(&helper_main));
+        SDL_SetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, "voice mixer helper");
+        SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, this);
+        SDL_SetNumberProperty(props, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER, 128 * 1024);
+        helper_ = SDL_CreateThreadWithProperties(props);
+        SDL_DestroyProperties(props);
+    }
+#endif
+}
+
+VoiceMixer::~VoiceMixer() {
+#if defined(__vita__)
+    if (helper_) {
+        helper_quit_.store(true);
+        SDL_SignalSemaphore(helper_go_);
+        SDL_WaitThread(helper_, nullptr);
+    }
+    if (helper_go_) SDL_DestroySemaphore(helper_go_);
+    if (helper_done_) SDL_DestroySemaphore(helper_done_);
+#endif
 }
 
 VoiceMixer::Voice* VoiceMixer::find(VoiceId id) {
@@ -438,21 +471,17 @@ constexpr bool kHalfRate = true;
 constexpr bool kHalfRate = false;
 #endif
 
-void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
-    const s32 master = p.master;
-    const bool gauss = p.gauss;
-    const bool rev = reverb_.mode() != SpuReverb::Off;
-    // Each bus sums its voices on its own and is scaled by its gain before the mix (a
-    // gain of 1 leaves the sum unchanged), so the reverb return follows the gains too.
-    auto scaled = [&p](const s32 (&sum)[2]) {
-        return s32((s64(sum[0]) * p.bus_gain[0] + s64(sum[1]) * p.bus_gain[1]) >> 16);
-    };
-    for (size_t n = 0; n < frames;) {
-        // Output samples this pass of the voices: 1, or 2 at half rate (the block's odd last one alone).
-        const int step = kHalfRate && n + 1 < frames ? 2 : 1;
-        s32 bus_l[2] = {}, bus_r[2] = {}, bus_wet_l[2] = {}, bus_wet_r[2] = {};
-        for (Voice& v : block_) {
-            if (v.phase == Phase::Off) continue;
+void VoiceMixer::render_voices(size_t first, size_t last, size_t frames, bool gauss, std::vector<PassSums>& sums) {
+    // Voice by voice, each through the block's passes: the same work as the passes over every voice in turn (each
+    // voice's state is its own), with the voice's state kept close, and any share of the voices on any thread.
+    for (size_t vi = first; vi < last && vi < block_.size(); ++vi) {
+        Voice& v = block_[vi];
+        if (v.phase == Phase::Off) continue;
+        size_t n = 0;
+        for (size_t pi = 0; pi < sums.size(); ++pi) {
+            // Output samples this pass of the voices: 1, or 2 at half rate (the block's odd last one alone).
+            const int step = kHalfRate && n + 1 < frames ? 2 : 1;
+            n += size_t(step);
             // Advance the source position by pitch/0x1000 samples (a sample's worth each output sample).
             v.counter += u32(v.hw_pitch) * u32(step);
             while (v.counter >= 0x1000 && !v.ended) {
@@ -466,7 +495,7 @@ void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
             if (v.ended) {
                 v.phase = Phase::Off;
                 v.data.reset();
-                continue;
+                break; // (nothing this pass or after)
             }
             const s32 p0 = v.hist[0], p1 = v.hist[1], p2 = v.hist[2], p3 = v.hist[3];
             s32 sample;
@@ -494,13 +523,56 @@ void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
             v.vol_l += std::clamp(v.target_l - v.vol_l, -slew, slew);
             v.vol_r += std::clamp(v.target_r - v.vol_r, -slew, slew);
             s32 l = (e * v.vol_l) >> 14, r = (e * v.vol_r) >> 14;
-            bus_l[v.bus] += l;
-            bus_r[v.bus] += r;
-            if (v.reverb) bus_wet_l[v.bus] += l, bus_wet_r[v.bus] += r;
-            if (v.phase == Phase::Off) v.data.reset();
+            PassSums& s = sums[pi];
+            s.l[v.bus] += l;
+            s.r[v.bus] += r;
+            if (v.reverb) s.wl[v.bus] += l, s.wr[v.bus] += r;
+            if (v.phase == Phase::Off) {
+                v.data.reset();
+                break; // (its envelope ended this pass: nothing after)
+            }
         }
-        const s32 dry[2] = {scaled(bus_l), scaled(bus_r)};
-        const s32 wet[2] = {rev ? scaled(bus_wet_l) : 0, rev ? scaled(bus_wet_r) : 0};
+    }
+}
+
+void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
+    const s32 master = p.master;
+    const bool gauss = p.gauss;
+    const bool rev = reverb_.mode() != SpuReverb::Off;
+    // Each bus sums its voices on its own and is scaled by its gain before the mix (a
+    // gain of 1 leaves the sum unchanged), so the reverb return follows the gains too.
+    auto scaled = [&p](const s32 (&sum)[2]) {
+        return s32((s64(sum[0]) * p.bus_gain[0] + s64(sum[1]) * p.bus_gain[1]) >> 16);
+    };
+    // The block's passes: an output sample each, or a pair at half rate (an odd last sample alone).
+    const size_t passes = kHalfRate ? frames / 2 + (frames & 1) : frames;
+    sums_.assign(passes, PassSums{}); // (its room kept: no allocation once grown)
+#if defined(__vita__)
+    if (helper_) {
+        // The voices after the middle of the playing ones go to the helper; the sums add up the same either way.
+        size_t playing = 0;
+        for (const Voice& v : block_) playing += v.phase != Phase::Off;
+        size_t mid = 0;
+        for (size_t seen = 0; mid < block_.size() && seen < (playing + 1) / 2; ++mid) seen += block_[mid].phase != Phase::Off;
+        helper_sums_.assign(passes, PassSums{});
+        job_first_ = mid, job_last_ = block_.size(), job_frames_ = frames, job_gauss_ = gauss;
+        SDL_SignalSemaphore(helper_go_); // (a system call: the job's fields are out before it)
+        render_voices(0, mid, frames, gauss, sums_);
+        SDL_WaitSemaphore(helper_done_);
+        for (size_t i = 0; i < passes; ++i) {
+            PassSums& a = sums_[i];
+            const PassSums& b = helper_sums_[i];
+            for (int k = 0; k < 2; ++k) a.l[k] += b.l[k], a.r[k] += b.r[k], a.wl[k] += b.wl[k], a.wr[k] += b.wr[k];
+        }
+    } else
+#endif
+        render_voices(0, block_.size(), frames, gauss, sums_);
+    size_t n = 0;
+    for (size_t pi = 0; pi < passes; ++pi) {
+        const int step = kHalfRate && n + 1 < frames ? 2 : 1;
+        const PassSums& s = sums_[pi];
+        const s32 dry[2] = {scaled(s.l), scaled(s.r)};
+        const s32 wet[2] = {rev ? scaled(s.wl) : 0, rev ? scaled(s.wr) : 0};
         for (int k = 0; k < step; ++k) {
             const bool half = k == 0 && step == 2; // a pair's first sample: halfway from the pair before
             s32 acc_l = half ? (last_dry_[0] + dry[0]) / 2 : dry[0];
@@ -520,5 +592,24 @@ void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
         n += size_t(step);
     }
 }
+
+#if defined(__vita__)
+int SDLCALL VoiceMixer::helper_main(void* self) {
+    static_cast<VoiceMixer*>(self)->helper_loop();
+    return 0;
+}
+
+void VoiceMixer::helper_loop() {
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2); // (the third core)
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);                       // (the audio thread's own)
+    prof::set_thread_off();
+    for (;;) {
+        SDL_WaitSemaphore(helper_go_);
+        if (helper_quit_.load()) return;
+        render_voices(job_first_, job_last_, job_frames_, job_gauss_, helper_sums_);
+        SDL_SignalSemaphore(helper_done_); // (its voices and sums out before it)
+    }
+}
+#endif
 
 } // namespace gt3r

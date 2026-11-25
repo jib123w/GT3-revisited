@@ -23,6 +23,14 @@ Ensō or HENlo). Work in progress on the `vita` branch.
    same folder. A crash leaves the system's core dump in `ux0:data/` too.
 4. The console needs `ur0:data/libshacccg.suprx` (ShaRKBR33D extracts it) for vitaGL's shaders.
 
+Race controls: GT3 original by default. Modern drives with the triggers, which the handheld has
+none of, so a config from before (which saved Modern as its default) is moved to GT3 original
+once (`[input] vita_race_layout`, `initial_race_layout`). GT3 original reads the menu buttons
+elsewhere; on the Vita it has its own set made from them (`PlayerBindings::set`,
+`vita_gt3_race`), because the handheld's L and R are the menu's L1 / R1 and it has no L2 / R2
+for the gears: what drives L1 / R1 shifts down / up, Select changes the view, the right stick
+looks around and back. Cross accelerates, Square brakes, as on the PS2.
+
 The touch screen: no on-screen pad on the Vita (`TouchControls::visible` is always false; it has
 its buttons), so touches go to the screen underneath. A touch anywhere shows a Settings tab in the
 top right corner for three seconds; tapping it opens Settings (`App::vita_tab_event`).
@@ -253,6 +261,10 @@ Done so far:
     `HAVE_GC_ON_FINISH=1`, so a GPU wait (`glFinish`) also frees everything waiting to be freed.
     Starting a race waits that way once the menus have released their models
     (`Gt3MenuScreen::start_game`). A load's own periodic waits (`note_gpu_submits`) free memory too.
+  - Black rear-view mirror: the mirror's mirrored view culls the front faces, and vitaGL culls
+    back faces only (its `change_cull_mode` sets `no_polygons_mode` for `GL_FRONT`: nothing drawn).
+    The OpenGL ES device turns a front cull into a back cull with the other winding in front
+    (the pipeline's set-up); vitaGL uses the winding for nothing else.
   - Crash at a race's end (exact physics, a new view's placeholder cube being cleared):
     `update_scissor_test` wrote through `sceGxmReserveVertexDefaultUniformBuffer`'s pointer
     without checking the call, and with no scene begun the pointer was stack garbage.
@@ -293,6 +305,109 @@ Done so far:
   that on a thread on the third core as soon as it is up (`race::prefetch_exact_program_data`).
   The race then finds it done, or waits for the rest of it. The log line
   `Race: Gran Turismo 3 physics (X s to read the program)` gives the time it took.
+- **Two profiles on the Vita**: Performance and Max performance (Quality and Balanced are not
+  built there). A fresh install starts on Max performance (`video_default`, the render scale's
+  default included) with a 30 fps frame rate limit (`App::fps_lock`'s Vita default). The Vita's Performance turns the dynamic resolution on: 75%, lowered in 5%
+  steps down to 50% when the GPU falls behind.
+- **Dynamic resolution on the Vita**: its target is the frame rate limit's frame time (33 ms at
+  30 fps; it aimed at 60 fps everywhere, so a capped frame looked late). A frame counts as
+  GPU-bound by the time spent waiting for the GPU: elsewhere that is in the present, on the Vita
+  at the passes' first clear, where vitaGL begins the GPU scene (`gles::take_gpu_wait_ms`, added
+  to the present's time).
+- **The mirror every other frame**: the rear-view mirror (in-car views; a second view of the
+  course) is drawn on alternate frames and its last picture shown in between
+  (`View3D::show_last`); a mirror not shown the frame before is drawn afresh.
+- **Anti-aliasing (MSAA)**: Off, 2x or 4x on the Display page. vitaGL is built with
+  `HAVE_ACCURATE_MSAA`: a multisampled pass draws into its resolve texture attached with
+  `glFramebufferTexture2DMultisample` (`vita_msaa_fbo`); vitaGL gives that frame buffer a render
+  target and depth buffer with the samples, and GXM averages them as it stores each tile. The
+  multisampled colour texture has no storage (`vita_samples`), there is no resolve blit, and the
+  reflection cube's faces stay single-sample. Off by default (`platform::default_msaa`): it costs
+  GPU time and memory.
+- **The race step on two cores**: measured on Trial Mountain with Performance, a race frame was
+  ~50 ms, all of it on the main thread: drawing ~40 (`v3d.encode` ~15, vitaGL's `gl.replay` ~20,
+  which must stay on the thread with the GL context) and the physics ~13.5 (`race.tick`, 3-4
+  steps a frame). The step's per-car phases that touch only their own car (steering, slip,
+  aids, dynamics, brake heat, the feedback; the chassis step, its effects then emitted in the
+  cars' order) go through `sim::exact::set_car_pool`: on the Vita a `WorkerPool` with one
+  worker on the third core shares the cars with the main thread. The results are the same as in
+  turn: each car's work reads and writes its own `Car` (plain data) and constant race data
+  (`CourseGround` has no mutable state; the scratch is `thread_local`), and the worker runs with
+  the main thread's FPSCR (the fast physics' rounding). The AI's planning, the collisions, the
+  random register's draws and the race flow stay in order on the main thread. Not on the second
+  core: SDL's audio thread mixes there, and a worker it preempts mid-car would hold the step up.
+- **A cheaper mirror**: drawn, it cost 20-25 ms (9-12 ms a frame at every other frame), half
+  of the main view for a strip ~64 lines tall, as the frame rate follows the draw calls. On the
+  Vita its scenery's small objects go at the size they have there (`min_size` six times the
+  main view's, at least 0.015), the cars behind take their simpler models six times nearer
+  (`race::car_lod_scale` for its collection), and it has no grading pass of its own.
+- **Small far objects at the dynamic resolution's lower steps**: the main view's `min_size`
+  (0.003 for Performance's 75%, 0.005 for Max performance's 50%) keeps the same size in pixels
+  when the resolution drops below that.
+- **The animated course nodes assembled on their worker**: their vertex and index lists
+  (`GpuModel::assemble_geometry`) are built on the third core with the nodes themselves; the
+  main thread only uploads them (`update_geometry(Assembled&&)`; ~2-3 ms a frame, in spikes
+  at the reduced animation's six updates a second).
+- **Draw calls in the log**: the PERF line gives the main view's draw calls a frame (`draws`)
+  and the mirror's when drawn (`mirror`); a view's stats add up over its passes of a frame.
+- **Draws without discards** (`PipelineKey::opaque`): `model.frag`'s PLAIN variant can discard
+  for three things only (the alpha test's kill, the dithered fade, the vertices' drop past GT3's
+  far plane), and on the PowerVR GPU a shader that can discard turns hidden-surface removal off
+  for its draws, so every layer of the scenery was shaded (GPU waits of 5-20 ms a frame at 50%).
+  A plain draw that is opaque and depth-writing, without the alpha test or a fade, of a mesh
+  wholly nearer than the far plane (`Visible::inside_far`, the culling's measure) uses the
+  variant built with `NO_DISCARD` (`GpuContext::fs_opaque_`; without it, the plain one).
+- **The race's steps on their own core** (`[race] physics_thread`, Settings "Physics on its own
+  core", on by default): in a live run (not online, replays or the licence results) `update`
+  leaves the frame's steps pending (`async_ticks_`) and `render_drive` runs them on an
+  `AsyncJob` on the third core while the main view is drawn (`start_async_ticks` just before
+  `View3D::draw`, `join_async_ticks` after: everything the view shows is collected before; the
+  mirror, the second view and the HUD read the race after). The picture shows the race as the
+  steps before left it, a frame later. A frame that draws no main view runs them in the next
+  update first; a restart, a new field and the screen's end join and drop them. `tick` touches
+  no GPU (its visual updates, smoke, pylons and car looks, are CPU state uploaded when the items
+  are collected); the GL layer logs an error if it is ever called off the main thread, and the
+  profiler counts the main thread only (`prof::set_thread_off`). The per-car helper moved to
+  the second core, with SDL's audio.
+- **Music decoded ahead** (`audio/prefetch_music.h`): the disc's music streams straight from the
+  disc image (`AdsStream` over `Volume::read_range`), and that read and the decoding ran in the
+  audio thread's callback, which mixes the race at ~90% of its core: a slow read of the memory
+  card ran the output dry and the music crackled. On the Vita every piece goes through
+  `PrefetchMusic`: a decoder thread on the third core (low priority) keeps ~1.5 s decoded
+  (32 blocks of 2,048 frames), the callback only copies, and the position it reports is the
+  played one, per block (the music cues). Behind, it plays silence rather than ending. A piece
+  that is replaced or stopped goes after the audio locks are let go (its decoder joins), still
+  before the disc it reads can close.
+- **The voices mixed on two cores**: with the music decoded ahead the audio thread was still
+  ~90% busy in races (the ~46 voices' SPU2 work, at half rate), and its busiest moments still
+  crackled. `VoiceMixer::render` now renders voice by voice through the block's passes
+  (`render_voices`, into per-pass bus sums), then runs the output stage (the bus gains, the
+  half-rate pairs, the reverb) as before; on the Vita a helper thread on the third core, at the
+  audio thread's priority, takes the voices after the middle of the playing ones meanwhile, and
+  its sums are added in. Each voice's work is its own and the sums are whole numbers, so the
+  output is the same to the bit (reviewed against the old loop; no host compiler here to test).
+- **Each car's second decode alongside the first**: `CarVisual` decodes the car twice (the body,
+  then the brake lamps' lit variant: a full `load_car_model` each, ~2 s a car in a race's load).
+  The lit one now runs on a loader `AsyncJob` on the third core while the main thread decodes
+  the body; it is joined before its result is used (and before the constructor's locals go, on
+  any exit), and an error in it is rethrown there. The decoder has no shared mutable state (the
+  texture pack's cache is locked; the stand-in rim, which reads the disc, is the wheels' only).
+- **Link-time optimisation** (`GT3R_LTO`, on): the engine and the game are optimised as one
+  program (`-flto`), so the draw loop's calls into the OpenGL ES layer and the race step's into
+  the physics inline; the eboot went from 8.77 MB to 7.97 MB. The Vita's FPU (VFPv3) has no fused
+  multiply-add, so it changes no float result. The printf wrappers (`--wrap`) survive it.
+- **Per-draw work cut** (thousands of primitives a frame): `encode` sets an item's lights once
+  (not for every primitive, with a `normalize`), skips building and comparing the vertex-lit
+  block when the item, material, sheen and 2x colour are those of the block pushed last
+  (`LitKey`), and keeps its visible and blended lists' room from pass to pass; the replay looks a
+  program's uniform locations up when the program changes, not with a map search every draw.
+- **The mirror tip**: the Vita's Performance description suggests turning the mirror off for
+  more frames; the mirror on or off keeps the profile there (`performance_profile` skips it).
+- **Fewer draws on Performance** (the lap: 1,600-2,900 a frame in the main view, ~15 us each,
+  2,600 ~15 fps and 1,100 ~20): `car_detail = normal` takes the simpler car models from half
+  GT3's distances on the Vita (the starting grid's full models), Performance's `min_size` is
+  0.004 there (0.006 at 50%), and the mirror is drawn every third frame, to 80 m, with its
+  threshold seven times the main view's (at least 0.02) and its cars' models eight times nearer.
 - **Opponents' models built once a race**: a race's load built the field two or three times (the
   start, `restart()`, the pre-race menu's `build_vehicle`). Each time it read and uploaded all the
   opponents' models again, ~2.3 s a car on the Vita: 22–33 s of a 45–53 s load. The screen now keeps

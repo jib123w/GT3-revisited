@@ -93,6 +93,10 @@ struct PipelineKey {
     // A small depth bias towards the eye (scene::kCoplanarOverlay): wins over the earlier face it
     // lies on, as GT3's Z buffer lets it.
     bool depth_bias = false;
+    // A plain draw that cannot discard (the Vita: model.frag's PLAIN variant built without its discards, NO_DISCARD):
+    // opaque, no alpha test, no fade, and its mesh wholly nearer than GT3's far plane. On the PowerVR GPU a shader
+    // that can discard turns hidden-surface removal off for its draws, so every layer of the scenery was shaded.
+    bool opaque = false;
     auto operator<=>(const PipelineKey&) const = default;
 };
 
@@ -226,7 +230,8 @@ private:
         FxFragment,
         CopyVertex,
         CopyFragment,
-        NoColorFragment
+        NoColorFragment,
+        OpaqueFragment // (PipelineKey::opaque; the Vita only)
     };
     SDL_GPUShader* make_shader(Stage stage);
     bool create_samplers();
@@ -258,6 +263,7 @@ private:
     SDL_GPUShader* fs_resample_ = nullptr; // model.frag's RESAMPLE variant (PipelineKey::resample)
     SDL_GPUShader* fs_fx_ = nullptr;       // model.frag's FX variant (PipelineKey::fx)
     SDL_GPUShader* fs_no_color_ = nullptr; // PipelineKey::depth_reset
+    SDL_GPUShader* fs_opaque_ = nullptr;   // the Vita: model.frag's PLAIN variant without discards (PipelineKey::opaque)
     // model.vert's and model.frag's SPIN_COPIES variants (null: spin_turn items drawn plain)
     SDL_GPUShader *vs_copy_ = nullptr, *fs_copy_ = nullptr;
     SDL_GPUSampler* samplers_[8] = {};

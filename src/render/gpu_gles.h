@@ -37,6 +37,10 @@ namespace gt3r::render::gles {
 SDL_GPUDevice* create_device(bool debug, bool angle);
 // True while the OpenGL ES device is the one in use.
 bool active();
+// The time render passes waited at their start since the last call, in ms, and zeroes it: on the Vita,
+// where vitaGL begins the GPU scene at a pass's first clear or draw and waits there when the GPU is
+// behind (not in the present, as elsewhere). The dynamic resolution counts it as GPU time. 0 elsewhere.
+double take_gpu_wait_ms();
 // True when the device in use asked for ANGLE (create_device).
 bool angle();
 // GL_VERSION and GL_RENDERER of the context, e.g. "OpenGL ES 3.0.0 (ANGLE ...); ANGLE (NVIDIA

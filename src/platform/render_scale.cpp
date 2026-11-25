@@ -38,7 +38,14 @@ float dynamic_ceiling(int pixel_w, int pixel_h) {
     return std::clamp(float(kDynamicMaxLines) / lines, 0.5f, 1.0f);
 }
 
-int default_msaa(bool mobile) { return mobile ? 2 : 4; }
+int default_msaa(bool mobile) {
+#if defined(SDL_PLATFORM_VITA)
+    (void)mobile;
+    return 1; // off: GXM's 2x / 4x cost GPU time and memory the Vita has little of (Settings turns it on)
+#else
+    return mobile ? 2 : 4;
+#endif
+}
 
 bool is_mobile() {
 #if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)

@@ -73,6 +73,20 @@ if(GT3R_VITA)
   # work from a weak reference to a pthread function that nothing else pulls in, and without it
   # every std::thread throws "Enable multithreading to use std::thread".
   target_link_libraries(gt3r_engine PUBLIC -Wl,--whole-archive pthread -Wl,--no-whole-archive)
+  # Link-time optimisation (GCC's -flto): the engine and the game optimised as one program, so calls across files
+  # inline (the draw loop's into the renderer and the OpenGL ES layer, the race step's into the physics). The Vita's
+  # FPU (VFPv3, -mfpu=neon) has no fused multiply-add, so nothing it inlines changes a float result.
+  option(GT3R_LTO "Link-time optimisation of the Vita build" ON)
+  if(GT3R_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT GT3R_IPO OUTPUT GT3R_IPO_LOG LANGUAGES C CXX)
+    if(GT3R_IPO)
+      set_property(TARGET gt3r_engine PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+      message(STATUS "Vita: link-time optimisation on")
+    else()
+      message(STATUS "Vita: no link-time optimisation (${GT3R_IPO_LOG})")
+    endif()
+  endif()
 endif()
 # Online play (src/net): Winsock on Windows.
 if(WIN32)
@@ -122,6 +136,9 @@ if(ANDROID)
 else()
   add_executable(gt3r ${GT3R_APP_SOURCES})
   set(GT3R_APP_TARGET gt3r)
+  if(GT3R_VITA AND GT3R_IPO)
+    set_property(TARGET gt3r PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE) # (the link optimises the whole program)
+  endif()
   if(IOS)
     # iPhone and iPad (docs/dev/PLATFORMS.md "iOS"), with the Xcode generator. Signing is never
     # committed: a device build gets the builder's own team and bundle identifier at configure time.

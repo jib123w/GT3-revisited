@@ -6,5 +6,6 @@
 namespace gt3r::hitch {
 inline double ticks_ms = 0, env_ms = 0, draw_ms = 0, collect_ms = 0;
 inline int ticks = 0, smoke = 0, meshes = 0;
+inline int draws = 0, mirror_draws = 0; // the main view's draw calls, the mirror's (when drawn)
 inline float x = 0, z = 0, race_t = 0;
 } // namespace gt3r::hitch

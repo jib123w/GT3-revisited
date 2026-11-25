@@ -25,6 +25,10 @@
 #include "platform/mac_layer.h"
 #include "race/custom_paints.h"
 #include "race/replay_library.h"
+#if defined(SDL_PLATFORM_VITA)
+#include "base/worker_pool.h"
+#include "sim/exact/tick.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -219,7 +223,7 @@ bool App::init(int argc, char** argv) {
     show_fps_ = to_lower(config_.get("video", "show_fps").value_or("off")) == "on";
     gamma_ = render::parse_gamma(config_.get("video", "gamma").value_or(""));
     // [video] render_scale = auto | 0.5..4.0 (auto: native on desktop, capped on mobile)
-    std::optional<float> render_scale = platform::parse_render_scale(config_.get("video", "render_scale").value_or("auto"));
+    std::optional<float> render_scale = platform::parse_render_scale(video_setting("render_scale")); // (the profile default on the Vita)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--no-gpu") use_gpu = false;
@@ -231,9 +235,19 @@ bool App::init(int argc, char** argv) {
     }
 #if defined(SDL_PLATFORM_VITA)
     // The OpenGL ES device on vitaGL, through SDL's vitaGL backend (docs/dev/VITA.md): first, as
-    // SDL_GPU has no Vita backend; no multisampled renderbuffers (vitaGL has none).
+    // SDL_GPU has no Vita backend. MSAA: GXM's 2x or 4x (render/gpu_gles.cpp vita_msaa_fbo), off unless
+    // [video] msaa asks (platform::default_msaa).
     gpu_opts.gles = true;
-    gpu_opts.msaa = 1;
+    gpu_opts.msaa = std::clamp(gpu_opts.msaa, 1, 4);
+    // The race step's per-car phases shared with a worker on the second core (sim::exact::set_car_pool): the main
+    // thread runs the game and the drawing on the first, the race's steps run on the third while a frame is drawn
+    // (RaceScreen::start_async_ticks), and SDL's audio, light, mixes on the second too.
+    {
+        static WorkerPool* const pool = new WorkerPool({1}); // (never destroyed: the process ends with it)
+        if (pool->workers() > 0)
+            sim::exact::set_car_pool([](size_t n, void (*fn)(void*, size_t), void* ctx) { pool->run(n, fn, ctx); });
+        LOG_INFO("Race step: %d per-car worker(s) on the second core", int(pool->workers()));
+    }
 #endif
     int win_pw = 0, win_ph = 0;
     SDL_GetWindowSizeInPixels(window_, &win_pw, &win_ph);
@@ -587,6 +601,9 @@ void App::set_limit_60fps(bool on) { set_fps_lock(on ? 60 : 0); }
 
 int App::fps_lock() const {
     const std::string v = to_lower(config_.get("video", "fps_lock").value_or(""));
+#if defined(SDL_PLATFORM_VITA)
+    if (v.empty() && !config_.get("video", "limit_60fps")) return 30; // (a steady 30: Max performance's races run ~27-30)
+#endif
     if (v.empty()) return limit_60fps() ? 60 : 0;
     const int n = std::atoi(v.c_str());
     return n >= 10 ? std::min(n, 240) : 0; // ("off": 0)
@@ -597,6 +614,7 @@ void App::set_fps_lock(int fps) {
     config_.remove("video", "limit_60fps"); // (fps_lock took its place)
     save_config();
     apply_frame_limit();
+    reset_dynamic_scale(); // (its frame time target is the limit's)
 }
 
 namespace {
@@ -614,6 +632,7 @@ struct PerformanceProfile {
     const char* values[kProfileKeyCount];
 };
 constexpr PerformanceProfile kPerformanceProfiles[] = {
+#if !defined(SDL_PLATFORM_VITA) // (beyond the Vita: docs/dev/VITA.md)
     {"Quality", "Everything on: full car detail, showroom wheels, car reflections and shadows, every replay effect, "
                 "full 3D resolution and draw distance. For fast computers.",
      {"on", "on", "on", "on", "high", "on", "on", "on", "auto", "off", "100", "full", "on", "on", "normal"}},
@@ -623,14 +642,29 @@ constexpr PerformanceProfile kPerformanceProfiles[] = {
     {"Performance", "No reflections or replay effects, 75% 3D resolution, the far scenery a little closer in, the "
                     "scenery's animations in steps. For phones and handhelds.",
      {"off", "off", "off", "on", "off", "off", "off", "off", "0.75", "off", "75", "reduced", "on", "on", "normal"}},
+#else
+    // The Vita's: the dynamic resolution lowers the 75% when the GPU cannot keep up with the frame rate
+    // limit (down to 50%); the mirror is drawn every other frame there (RaceScreen::draw_mirror).
+    {"Performance", "Car shadows, the rear-view mirror and colour grading on, the far scenery a little closer in, "
+                    "the scenery's animations in steps; 75% 3D resolution, lowered when the GPU falls behind. "
+                    "For better fps turn off the rear-view mirror (Details below).",
+     {"off", "off", "off", "on", "off", "off", "off", "off", "0.75", "on", "75", "reduced", "on", "on", "normal"}},
+#endif
     {"Max performance", "The fewest draws: no car shadows either, 50% 3D resolution and half the draw distance (far "
-                        "scenery pops in), the scenery's animations in steps, no rear-view mirror or colour grading, simpler cars nearby. For the PlayStation Vita.",
+                        "scenery pops in), the scenery's animations in steps, no rear-view mirror or colour grading, simpler cars nearby.",
      {"off", "off", "off", "off", "off", "off", "off", "off", "0.5", "off", "50", "reduced", "off", "off", "low"}},
 };
 constexpr int kPerformanceProfileCount = int(sizeof(kPerformanceProfiles) / sizeof(kPerformanceProfiles[0]));
 
 // The default of a [video] setting the profiles change (the getters' and the race's).
 std::string video_default(std::string_view key) {
+#if defined(SDL_PLATFORM_VITA)
+    // The Vita starts on its Max performance profile (Performance is a step up, for those who want it).
+    for (const PerformanceProfile& p : kPerformanceProfiles)
+        if (std::string_view(p.name) == "Max performance")
+            for (size_t k = 0; k < kProfileKeyCount; ++k)
+                if (key == kProfileKeys[k]) return p.values[k];
+#endif
     const bool low = platform::low_power();
     if (key == "full_car_detail" || key == "showroom_wheels") return low ? "off" : "on";
     if (key == "depth_of_field") return low ? "off" : "high";
@@ -677,8 +711,13 @@ const char* App::performance_profile_desc(int i) {
 int App::performance_profile() const {
     for (int i = 0; i < kPerformanceProfileCount; ++i) {
         bool all = true;
-        for (size_t k = 0; k < kProfileKeyCount && all; ++k)
+        for (size_t k = 0; k < kProfileKeyCount && all; ++k) {
+#if defined(SDL_PLATFORM_VITA)
+            // (The mirror on or off keeps the profile: Performance suggests turning it off for more frames.)
+            if (std::string_view(kProfileKeys[k]) == "rear_mirror") continue;
+#endif
             all = profile_value_matches(kProfileKeys[k], video_setting(kProfileKeys[k]), kPerformanceProfiles[i].values[k]);
+        }
         if (all) return i;
     }
     return -1;
@@ -816,7 +855,7 @@ void App::set_dynamic_resolution(bool on) {
 }
 
 void App::apply_render_scale() {
-    std::optional<float> v = platform::parse_render_scale(config_.get("video", "render_scale").value_or("auto"));
+    std::optional<float> v = platform::parse_render_scale(video_setting("render_scale")); // (the profile default on the Vita)
     int pw = 0, ph = 0;
     SDL_GetWindowSizeInPixels(window_, &pw, &ph);
     configured_scale_ = v ? *v : platform::auto_render_scale(pw, ph, platform::is_mobile());
@@ -873,7 +912,7 @@ void App::reset_dynamic_scale() {
                 LOG_INFO("Dynamic resolution: starting at %d%% (the last race's)", int(std::lround(start * 100)));
             }
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
-    dyn_.reset(ceiling, mode ? mode->refresh_rate : 0, start);
+    dyn_.reset(ceiling, mode ? mode->refresh_rate : 0, start, fps_lock()); // (frames on the limit's time are on time)
     if (dyn_on_) gpu_->set_render_scale(dyn_.scale()), gpu_->set_render_ceiling(ceiling); // targets sized once
 }
 
@@ -1117,7 +1156,10 @@ SDL_AppResult App::iterate() {
     const Uint64 present_start = SDL_GetTicksNS();
     { GT3R_PROF("app.render_present"); SDL_RenderPresent(renderer_); }
     if (gpu_) gpu_->frame_presented();
-    const double present_ms = double(SDL_GetTicksNS() - present_start) / 1e6;
+    double present_ms = double(SDL_GetTicksNS() - present_start) / 1e6;
+#if GT3R_GLES
+    present_ms += render::gles::take_gpu_wait_ms(); // the Vita waits for the GPU at the passes' starts instead
+#endif
     // A lost GPU (Vulkan's VK_ERROR_DEVICE_LOST, which SDL only reports in its error text) never
     // comes back, and the frames that never finish grow the memory by hundreds of MB a second
     // until the system kills us: close with a message instead.
@@ -1161,19 +1203,23 @@ SDL_AppResult App::iterate() {
         if (h_prev_end) {
             static double sum[9];
             static int n = 0, ticks = 0, meshes = 0;
+            static long long draws = 0, mirror_draws = 0, mirror_frames = 0; // (summed: averages a frame)
             const double part[9] = {double(h_end - h_prev_end) / 1e6, double(h_u0 - h_prev_end) / 1e6,
                                     double(h_u1 - h_u0) / 1e6, hitch::ticks_ms, double(h_r1 - h_r0) / 1e6,
                                     hitch::env_ms, hitch::collect_ms, hitch::draw_ms, double(h_end - h_r1) / 1e6};
             for (int i = 0; i < 9; ++i) sum[i] += part[i];
             ticks += hitch::ticks, meshes = std::max(meshes, hitch::meshes), ++n;
-            hitch::ticks = hitch::meshes = 0; // (screens without them leave them unset)
+            draws += hitch::draws;
+            if (hitch::mirror_draws > 0) mirror_draws += hitch::mirror_draws, ++mirror_frames;
+            hitch::ticks = hitch::meshes = hitch::draws = hitch::mirror_draws = 0; // (screens without them leave them unset)
             hitch::ticks_ms = hitch::env_ms = hitch::collect_ms = hitch::draw_ms = 0;
             if (sum[0] >= 2000) {
                 const double k = 1.0 / n;
                 LOG_INFO("PERF %.1f fps: frame %.1f ms (pre %.1f, update %.1f [%.1f ticks %.1f], render %.1f [env %.1f "
-                         "collect %.1f draw %.1f], present %.1f) meshes %d scale %d%%",
+                         "collect %.1f draw %.1f], present %.1f) meshes %d draws %d mirror %d scale %d%%",
                          1000.0 * n / sum[0], sum[0] * k, sum[1] * k, sum[2] * k, ticks * k, sum[3] * k, sum[4] * k,
-                         sum[5] * k, sum[6] * k, sum[7] * k, sum[8] * k, meshes,
+                         sum[5] * k, sum[6] * k, sum[7] * k, sum[8] * k, meshes, int(draws / n),
+                         int(mirror_frames ? mirror_draws / mirror_frames : 0),
                          int(std::lround((gpu_ ? gpu_->render_scale() : 1.0f) * 100)));
                 // The GT3R_PROF sections (base/prof.h), ms a frame and calls a frame, the largest
                 // first; the audio thread's mixing as a share of the wall clock.
@@ -1200,6 +1246,7 @@ SDL_AppResult App::iterate() {
                          100.0 * audio / sum[0], double(mi.uordblks) / 1048576.0, double(mi.arena) / 1048576.0);
                 for (double& s : sum) s = 0;
                 n = ticks = meshes = 0;
+                draws = mirror_draws = mirror_frames = 0;
             }
         }
 #endif

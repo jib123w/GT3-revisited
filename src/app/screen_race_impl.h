@@ -6,6 +6,7 @@
 // are in screen_race.h and screen_online.h.
 
 #include "base/prof.h"
+#include "base/async_job.h"
 #include "app/app.h"
 #include "app/camera_editor.h"
 #include "app/screen_gtmode.h"
@@ -354,6 +355,20 @@ private:
     // Ours: the look around from a race pad's right stick (CameraRig::set_look).
     void look_around(App& app, CameraRig& cam, const PadState& pad) const;
     void tick(App& app, const PadState& pad);
+    // The Vita ([race] physics_thread, on unless off): a live run's race steps for the frame run on the third core
+    // while the main view is drawn (render_drive: start_async_ticks before its draw, join_async_ticks after), not in
+    // update, which leaves them pending (async_ticks_): the frame shows the race as the steps before left it, a frame
+    // later. A frame that does not draw the main view runs them in the next update first (run_pending_ticks). The steps
+    // touch no GPU (vitaGL is the main thread's), and nothing between the start and the join reads the race.
+    bool async_physics_ = false;
+    int async_ticks_ = 0;
+    PadState async_pad_{};
+    double async_ms_ = 0;
+    std::unique_ptr<AsyncJob> step_job_;
+    bool async_ticks_allowed() const { return async_physics_ && !online_ && !prize_ && live_view(); }
+    void run_pending_ticks(App& app);
+    void start_async_ticks(App& app);
+    void join_async_ticks();
     void update_drive(App& app, double dt);
     static ForceFeedbackState feedback(const sim::VehicleState& s, const sim::VehicleTelemetry& t, const sim::ControlInputs& in,
                                        float wall, float car_hit);
@@ -1113,6 +1128,13 @@ private:
     sim::VehicleState render_state2_;
     std::unique_ptr<render::View3D> view2_;
     std::unique_ptr<render::View3D> mirror_view_, mirror_view2_;
+    // The Vita's mirrors, drawn every third frame (draw_mirror): the frame each was last shown, and
+    // where it is in its three (0: drawn).
+    struct MirrorPace {
+        u64 serial = ~u64(0);
+        int phase = 0;
+    };
+    MirrorPace mirror_pace_[2];
 #if GT3R_XR
     std::unique_ptr<render::View3D> vr_views_[2]; // the eyes (screen_race_vr.cpp)
 #endif

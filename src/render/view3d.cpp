@@ -428,6 +428,7 @@ View3D::~View3D() {
 }
 
 void View3D::release_target() {
+    shown_ = nullptr;
     for (SDL_Texture** w : {&wrapper_, &half_wrapper_}) {
         if (*w) SDL_DestroyTexture(*w);
         *w = nullptr;
@@ -515,6 +516,7 @@ bool View3D::ensure_half(SDL_Renderer* renderer) {
 void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& view, const Mat4& proj, const Vec3& eye,
                   const std::vector<DrawItem>& items, const DrawOptions& opt) {
     GT3R_PROF("v3d.draw");
+    stats_ = {};
     // Logical (UI) rectangle -> physical pixels.
     float sx = 1, sy = 1;
     int lw = 0, lh = 0;
@@ -760,6 +762,13 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
     const SDL_FRect src{0, 0, float(sw) - (sw < tw ? inset : 0.0f), float(sh) - (sh < th ? inset : 0.0f)};
     SDL_RenderTexture(renderer, shown, &src, &rect);
     SDL_SetTextureAlphaModFloat(shown, 1.0f);
+    shown_ = shown, shown_src_ = src;
+}
+
+bool View3D::show_last(SDL_Renderer* renderer, const SDL_FRect& rect) {
+    if (!shown_) return false;
+    SDL_RenderTexture(renderer, shown_, &shown_src_, &rect); // (its blend mode as draw() left it)
+    return true;
 }
 
 bool View3D::post_wanted(const DrawOptions& o) const {
@@ -1430,6 +1439,7 @@ void View3D::encode_dof(SDL_GPUCommandBuffer* cmd, const DrawOptions& o, const M
 bool View3D::draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, const Mat4& proj, const Vec3& eye,
                      const std::vector<DrawItem>& items, const DrawOptions& opt) {
     if (!target || w <= 0 || h <= 0) return false;
+    stats_ = {};
     SDL_GPUDevice* dev = ctx_.device();
     Offscreen& o = direct_;
     if (!o.depth || o.w != w || o.h != h || o.samples != ctx_.msaa()) {
@@ -1546,9 +1556,13 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
         Mat4 world;
         float dist;
         int copies = 0, cells = 0; // a DrawItem::spin_turn item's turned copies (instances)
+        bool inside_far = false;   // wholly nearer than GT3's far plane (or none): its vertices never drop (opaque)
     };
-    std::vector<Visible> vis;
-    stats_ = {};
+    // (Kept from pass to pass, its room with it: a few hundred entries every pass, the newlib heap is slow. One encode
+    // at a time, on the main thread. stats_ add up over the frame's passes: reset by draw and draw_to.)
+    static std::vector<Visible> vis_kept;
+    std::vector<Visible>& vis = vis_kept;
+    vis.clear();
     for (const DrawItem& item : items) {
         const GpuModel* model = item.model;
         if (!model || !model->valid()) continue;
@@ -1568,8 +1582,10 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
                 return;
             }
             ++stats_.meshes_drawn;
+            const float far = item_far(item, opt);
+            const bool inside_far = far <= 0 || eye_depth(view, m.center) + m.radius < far;
             if (item.spin_turn == 0 || !ctx_.spin_copies()) {
-                vis.push_back({&item, &mesh, m.world, m.dist});
+                vis.push_back({&item, &mesh, m.world, m.dist, 0, 0, inside_far});
                 return;
             }
             // A spinning modelled rim: copies turned about the item's x axis, as many as its size on
@@ -1703,6 +1719,32 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
     // alpha test (with depth write, in the opaque phase), 2 = the failing ones (blended,
     // no depth write, in the blended phase). 0 = whole primitive. Car reflections over a
     // cut-out (hole_split) too: 3 = the cut-out's hole, in the opaque phase, 4 = the rest.
+    // The item whose lights `fu` holds (draw_prim sets them once per item), and the vertex-lit block pushed last.
+    const DrawItem* lit_item = nullptr;
+    struct LitKey {
+        bool valid = false;
+        const DrawItem* item = nullptr;
+        bool sheen = false, color_2x = false;
+        float mat[16] = {};
+        static void material(const FragmentUniforms& u, float (&m)[16]) {
+            std::copy(std::begin(u.mat_ambient), std::end(u.mat_ambient), m);
+            std::copy(std::begin(u.mat_diffuse), std::end(u.mat_diffuse), m + 4);
+            std::copy(std::begin(u.mat_specular), std::end(u.mat_specular), m + 8);
+            std::copy(std::begin(u.mat_emission), std::end(u.mat_emission), m + 12);
+        }
+        bool matches(const DrawItem* i, bool s, bool c, const FragmentUniforms& u) const {
+            if (!valid || i != item || s != sheen || c != color_2x) return false;
+            float m[16];
+            material(u, m);
+            return std::memcmp(m, mat, sizeof(m)) == 0;
+        }
+        void set(bool on, const DrawItem* i, bool s, bool c, const FragmentUniforms& u) {
+            valid = on;
+            if (!on) return;
+            item = i, sheen = s, color_2x = c;
+            material(u, mat);
+        }
+    } lit_key;
     // Per-vertex lighting off until a primitive needs it (slot 1 of the vertex uniforms).
     push_lighting(VertexLighting{});
     bool vl_on = false;
@@ -1746,6 +1788,14 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
             frame_alpha_written_ = frame_alpha_written_ || key.alpha != AlphaWrite::Keep;
         }
         key.transmission = opt.transmission && !key.depth_only;
+#if defined(SDL_PLATFORM_VITA)
+        // A plain draw that cannot discard (PipelineKey::opaque): opaque and depth-writing, no alpha test (the PLAIN
+        // variant's kill), no fade (its dithered discard), its mesh wholly nearer than GT3's far plane (the vertices'
+        // drop), no guard band (the Vita has none).
+        key.opaque = key.plain && !key.gs_filter && !key.fx && !key.spin_copy && !key.depth_only &&
+                     key.blend == BlendMode::Opaque && key.depth_write && half == 0 && !(p.flags & scene::kAlphaTest) &&
+                     v.item->fade >= 1.0f && v.inside_far && !guard_on_;
+#endif
         if (spin_mask) {
             const CullMode cull = key.cull;
             key = PipelineKey{};
@@ -1805,7 +1855,10 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
             // buffer alpha the base pass wrote (1.0 on these models), not by the texel alpha.
             fu.params[2] = (p.flags & scene::kAdditive) ? 1.0f : 0.0f;
         }
-        if (const ItemLights* il = v.item->lights) {
+        // The lights depend on the item alone (and the pass's options): set when the item changes (the primitives of
+        // one item are drawn together, so this ran for every one of thousands a frame).
+        if (v.item == lit_item) {
+        } else if (const ItemLights* il = (lit_item = v.item)->lights) {
             float* dirs[4] = {fu.light_dir, fu.light2_dir, fu.light3_dir, fu.light4_dir};
             float* difs[4] = {fu.light_diffuse, fu.light2_diffuse, fu.light3_diffuse, fu.light4_diffuse};
             float* spes[4] = {fu.light_specular, fu.light2_specular, fu.light3_specular, fu.light4_specular};
@@ -1826,8 +1879,7 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
                 fu.light_diffuse[i] = opt.light_diffuse[i] * v.item->light_scale[1];
                 fu.light_specular[i] = opt.light_specular[i] * v.item->light_scale[2];
             }
-            Vec3 ld = normalize(opt.light_dir);
-            fu.light_dir[0] = ld.x, fu.light_dir[1] = ld.y, fu.light_dir[2] = ld.z;
+            fu.light_dir[0] = l.x, fu.light_dir[1] = l.y, fu.light_dir[2] = l.z; // (normalize(opt.light_dir): above)
             float* dirs[3] = {fu.light2_dir, fu.light3_dir, fu.light4_dir};
             float* difs[3] = {fu.light2_diffuse, fu.light3_diffuse, fu.light4_diffuse};
             float* spes[3] = {fu.light2_specular, fu.light3_specular, fu.light4_specular};
@@ -1888,7 +1940,11 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
         // GT3's light model viewer (0, 2, 0) in eye space, 2 m along the camera's up axis.
         const bool vertex_lit = mt.valid && fu.params[1] < 0.5f && (fu.params[3] < 0.5f || sheen);
         const bool color_2x = (p.flags & scene::kVertexColor2x) != 0;
-        if (vertex_lit || vertex_env || color_2x || vl_on) {
+        // The vertex-lit block is the item's lights, the material, the sheen and the 2x colour (the pass's view and
+        // camera are the same throughout): with all as for the block pushed last, it is that one (built and compared
+        // for nothing, ~400 bytes, for most primitives).
+        const bool lit_cached = vertex_lit && !vertex_env && lit_key.matches(v.item, sheen, color_2x, fu);
+        if (!lit_cached && (vertex_lit || vertex_env || color_2x || vl_on)) {
             VertexLighting vl{};
             vl.vertex_color[0] = color_2x ? 1.0f : 0.0f;
             if (vertex_env) {
@@ -1946,6 +2002,7 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
             }
             push_lighting(vl);
             vl_on = vertex_lit || vertex_env || color_2x;
+            lit_key.set(vertex_lit && !vertex_env, v.item, sheen, color_2x, fu);
         }
         push_fragment(fu);
         const u32 first = v.mesh->index_offset + p.first_index;
@@ -2051,7 +2108,9 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
         }
     }
     // The other blended primitives: model order, or back to front by mesh distance.
-    std::vector<const Visible*> blended;
+    static std::vector<const Visible*> blended_kept; // (kept as vis is)
+    std::vector<const Visible*>& blended = blended_kept;
+    blended.clear();
     for (const Visible& v : vis)
         if (!v.item->background && !v.item->in_order && (solid || v.item->helper))
             for (const scene::Primitive& p : v.mesh->primitives)
@@ -2333,14 +2392,21 @@ bool View3D::ensure_cube(int size) {
     ti.type = SDL_GPU_TEXTURETYPE_2D;
     ti.layer_count_or_depth = 1;
     bool msaa_ok = true;
-    if (ctx_.sample_count() != SDL_GPU_SAMPLECOUNT_1) {
+#if defined(SDL_PLATFORM_VITA)
+    // Single-sample faces on the Vita: its pipelines do not depend on the sample count, and a face
+    // draws into a 2D stand-in that is then copied in (render/gpu_gles.cpp), not into a resolve.
+    const SDL_GPUSampleCount face_samples = SDL_GPU_SAMPLECOUNT_1;
+#else
+    const SDL_GPUSampleCount face_samples = ctx_.sample_count();
+#endif
+    if (face_samples != SDL_GPU_SAMPLECOUNT_1) {
         ti.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
-        ti.sample_count = ctx_.sample_count();
+        ti.sample_count = face_samples;
         for (SDL_GPUTexture*& t : cube_msaa_) msaa_ok = (t = SDL_CreateGPUTexture(dev, &ti)) && msaa_ok;
     }
     ti.format = ctx_.depth_format();
     ti.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
-    ti.sample_count = ctx_.sample_count();
+    ti.sample_count = face_samples;
     cube_depth_ = SDL_CreateGPUTexture(dev, &ti);
     if (!cube_ || !cube_depth_ || !msaa_ok) {
         LOG_WARN("Environment cube %d creation failed: %s", size, SDL_GetError());

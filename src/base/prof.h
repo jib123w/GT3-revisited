@@ -31,9 +31,15 @@ inline int slot(const char* name) {
     return used++;
 }
 
+// Threads whose sections are not counted (set_thread_off): the slots are the main thread's, unsynchronised (the race's
+// steps on their own thread, base/async_job.h).
+inline thread_local bool thread_off = false;
+inline void set_thread_off() { thread_off = true; }
+
 class Scope {
 public:
     Scope(int& index, const char* name) : t0_(SDL_GetTicksNS()) {
+        if (thread_off) return;
         if (index < 0) index = slot(name);
         index_ = index;
     }

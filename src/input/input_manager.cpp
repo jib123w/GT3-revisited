@@ -65,6 +65,12 @@ bool contains_ci(const std::string& hay, const std::string& needle) {
 // [playerN] race; before it existed, [race] buttons = gt3 | ours | auto (auto: GT3's layout
 // with the classic preset) chose the race buttons for everyone.
 std::string initial_race_layout(const IniDocument& cfg, const std::string& sec, const std::string& preset) {
+#if defined(__vita__)
+    // The Vita starts on GT3 original (its own set there: L / R shift, PlayerBindings::set): Modern drives
+    // with the triggers, which the handheld has none of. Once also where an earlier version saved Modern
+    // as its default (InputManager::save marks it done).
+    if (!cfg.get("input", "vita_race_layout")) return "gt3";
+#endif
     if (auto r = cfg.get(sec, "race")) return to_lower(*r) == "gt3" ? "gt3" : "modern";
     std::string b = to_lower(cfg.get("race", "buttons").value_or("auto"));
     return b == "gt3" || (b == "auto" && preset == "classic") ? "gt3" : "modern";
@@ -173,6 +179,9 @@ void InputManager::save(IniDocument& cfg) const {
         p.actions.save(cfg, sec);
     }
     cfg.set("input", "background", background_ ? "on" : "off");
+#if defined(__vita__)
+    cfg.set("input", "vita_race_layout", "done"); // (the move to GT3 original made: initial_race_layout)
+#endif
 #ifdef SDL_PLATFORM_WINDOWS
     cfg.set("input", "xbox_driver", xbox_rawinput_ ? "rawinput" : "xinput");
 #endif

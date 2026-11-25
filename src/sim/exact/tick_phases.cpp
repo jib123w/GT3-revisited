@@ -7,7 +7,29 @@
 
 #include "sim/exact/pit_lane.h"
 
+#include <type_traits>
+#include <vector>
+
 namespace gt3r::sim::exact {
+
+namespace {
+
+CarPool g_car_pool = nullptr;
+
+// fn(i) for every car through the pool (set_car_pool), else in turn.
+template <class Fn>
+void for_each_car(size_t n, Fn&& fn) {
+    if (!g_car_pool || n < 2) {
+        for (size_t i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    using Job = std::remove_reference_t<Fn>;
+    g_car_pool(n, [](void* ctx, size_t i) { (*static_cast<Job*>(ctx))(i); }, &fn);
+}
+
+} // namespace
+
+void set_car_pool(CarPool pool) { g_car_pool = pool; }
 
 void class_grip_scale(Car& c, const ClassGrip& grip) {
     if (!toward_zero(c.behaviour) || !(c.control == 1 || c.control == 2 || c.driver_kind != 0)) return;
@@ -91,18 +113,18 @@ void tick_until_collision(std::span<Car> cars, std::span<const CarInputs> in, co
     if (later)
         for (size_t i = 0; i < n; ++i)
             if (run(i)) stop_count_step(cars[i]);
-    for (size_t i = 0; i < n; ++i)
-        if (run(i)) wheel_steer(cars[i]);
-    for (size_t i = 0; i < n; ++i)
-        if (run(i)) slip_ratios(cars[i], race.statics);
-    for (size_t i = 0; i < n; ++i)
-        if (run(i)) aids(cars[i], race.aids);
-    for (size_t i = 0; i < n; ++i)
-        if (run(i)) dynamics(cars[i], race.statics, race.gears, race.class_grip);
-    for (size_t i = 0; i < n; ++i)
-        if (run(i)) brake_heat(cars[i], race.brake_heat);
-    for (size_t i = 0; i < n; ++i)
-        if (run(i)) clear_feedback(cars[i]);
+    // Steering to the feedback: each of these reads and writes its own car only (and the race's constants), so a car's
+    // run of them is the same as each phase for every car in turn; the cars go through the pool.
+    for_each_car(n, [&](size_t i) {
+        if (!run(i)) return;
+        Car& c = cars[i];
+        wheel_steer(c);
+        slip_ratios(c, race.statics);
+        aids(c, race.aids);
+        dynamics(c, race.statics, race.gears, race.class_grip);
+        brake_heat(c, race.brake_heat);
+        clear_feedback(c);
+    });
 }
 
 void tick_after_collision(std::span<Car> cars, std::span<const CarInputs> in, const RaceInputs& race, Proximity* k,
@@ -118,12 +140,21 @@ void tick_after_collision(std::span<Car> cars, std::span<const CarInputs> in, co
     ch.course_kind = race.aids.course_category, ch.sound_scales = race.sound_scales, ch.condition = race.prep.condition;
     ch.course_out = race.course_out.on ? &race.course_out : nullptr;
     ch.ride = race.ride.on ? &race.ride : nullptr;
-    for (size_t i = 0; i < n; ++i) {
-        if (!run(i)) continue;
-        ch.mark_flagged = in[i].mark_flagged, ch.box_heading = in[i].box_heading;
-        ch.x70 = in[i].x70, ch.ghost_switch = in[i].ghost_switch;
-        emit(int(i), chassis(cars[i], ch), rng);
-    }
+    // Each car's chassis step reads and writes its own car only (and the course, read only): through the pool, its
+    // outputs kept, then their effects emitted in the cars' order (the emitter draws the random register and reads
+    // only the car it is given, which no other car's chassis step touches).
+    static thread_local std::vector<ChassisOutputs> outs_here;
+    std::vector<ChassisOutputs>& outs = outs_here; // (named so the lambda captures this thread's, not the worker's own)
+    outs.assign(n, ChassisOutputs{});
+    for_each_car(n, [&](size_t i) {
+        if (!run(i)) return;
+        ChassisInputs ci = ch;
+        ci.mark_flagged = in[i].mark_flagged, ci.box_heading = in[i].box_heading;
+        ci.x70 = in[i].x70, ci.ghost_switch = in[i].ghost_switch;
+        outs[i] = chassis(cars[i], ci);
+    });
+    for (size_t i = 0; i < n; ++i)
+        if (run(i)) emit(int(i), outs[i], rng);
     for (size_t i = 0; i < n; ++i)
         if (run(i)) tire_wear(cars[i], race.prep.wear);
     for (size_t i = 0; i < n; ++i)

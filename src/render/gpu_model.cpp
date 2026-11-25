@@ -223,12 +223,21 @@ bool GpuModel::update_textures(const std::vector<TextureUpdate>& updates) {
 GpuModel::GpuModel(GpuContext& ctx, const GpuModel& textures)
     : ctx_(&ctx), device_(ctx.device()), texture_source_(&textures) {}
 
+GpuModel::Assembled GpuModel::assemble_geometry(const std::vector<scene::Mesh>& meshes, size_t texture_count) {
+    Assembled a;
+    assemble(meshes, texture_count, false, a.vertices, a.indices, a.meshes);
+    return a;
+}
+
 bool GpuModel::update_geometry(const std::vector<scene::Mesh>& meshes) {
+    return update_geometry(assemble_geometry(meshes, textures().size()));
+}
+
+bool GpuModel::update_geometry(Assembled&& geometry) {
     GT3R_PROF("gpu.update_geometry");
-    std::vector<scene::Vertex> vertices;
-    std::vector<u32> indices;
-    meshes_.clear();
-    assemble(meshes, textures().size(), false, vertices, indices, meshes_);
+    std::vector<scene::Vertex> vertices = std::move(geometry.vertices);
+    std::vector<u32> indices = std::move(geometry.indices);
+    meshes_ = std::move(geometry.meshes);
     index_nodes();
     vertex_count_ = vertices.size();
     const u32 vsize = u32(vertices.size() * sizeof(scene::Vertex)), isize = u32(indices.size() * sizeof(u32));

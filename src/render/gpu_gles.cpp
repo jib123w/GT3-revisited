@@ -21,11 +21,13 @@
 #include <GLES3/gl3.h>       // third_party/khronos
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
@@ -368,6 +370,9 @@ struct SDL_GPUTexture {
     GLuint rb = 0;     // renderbuffer: multisampled, or a depth target that is never sampled
     GLenum target = 0; // GL_TEXTURE_2D or GL_TEXTURE_CUBE_MAP (textures)
     GLsizei levels = 1; // mip levels made (the Vita: fewer than asked, vita_levels)
+    // The Vita: a multisampled colour target, with no storage of its own: its passes draw into their
+    // resolve texture through a multisampled frame buffer (vita_msaa_fbo).
+    GLsizei vita_samples = 0;
 };
 
 struct SDL_GPUBuffer {
@@ -477,6 +482,7 @@ struct SDL_GPUDevice {
 namespace {
 
 SDL_GPUDevice* g_device = nullptr; // while the OpenGL ES device is in use (gles::create_device)
+Uint64 g_gpu_wait_ns = 0;           // the Vita's waits at the passes' starts (gles::take_gpu_wait_ms)
 
 } // namespace
 
@@ -484,6 +490,14 @@ namespace {
 
 // Hands the context over from SDL's 2D renderer (see the file comment).
 void begin_gl(SDL_GPUDevice* dev) {
+#if defined(__vita__)
+    // vitaGL is the main thread's only (the race's steps run on another while the frame is drawn: none may draw).
+    static const SDL_ThreadID gl_thread = SDL_GetCurrentThreadID();
+    if (SDL_GetCurrentThreadID() != gl_thread) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) LOG_ERROR("OpenGL ES: called off the main thread (a bug: vitaGL is not thread safe)");
+    }
+#endif
     if (dev && dev->renderer) SDL_FlushRenderer(dev->renderer);
 }
 
@@ -594,6 +608,33 @@ GLuint pass_fbo(SDL_GPUDevice* dev, const SDL_GPUTexture* color, Uint32 layer, U
     dev->fbos[key] = fbo;
     return fbo;
 }
+
+#if defined(__vita__)
+// A pass of a multisampled colour target (vita_samples): its resolve texture as the frame buffer's colour,
+// attached multisampled (vitaGL's GL_EXT_multisampled_render_to_texture, built with HAVE_ACCURATE_MSAA).
+// vitaGL gives that frame buffer a render target and a depth buffer with the samples, and GXM averages
+// them as it stores each tile into the texture: no storage for the samples, no resolve blit.
+GLuint vita_msaa_fbo(SDL_GPUDevice* dev, const SDL_GPUTexture* resolve, GLsizei samples, const SDL_GPUTexture* depth) {
+    using AttachMs = void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei);
+    static const AttachMs attach_ms =
+        reinterpret_cast<AttachMs>(SDL_GL_GetProcAddress("glFramebufferTexture2DMultisample"));
+    const auto key = std::make_tuple(object_key(resolve), Uint32(0x80000000u) | Uint32(samples), Uint32(0), object_key(depth));
+    if (auto it = dev->fbos.find(key); it != dev->fbos.end()) {
+        glBindFramebuffer(GL_FRAMEBUFFER, it->second);
+        return it->second;
+    }
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    if (attach_ms && resolve->tex && resolve->target == GL_TEXTURE_2D)
+        attach_ms(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolve->tex, 0, samples);
+    else
+        attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, resolve, 0, 0); // (single-sample)
+    if (depth) attach(GL_FRAMEBUFFER, depth_attachment(depth), depth, 0, 0);
+    dev->fbos[key] = fbo;
+    return fbo;
+}
+#endif
 
 void forget_fbos(SDL_GPUDevice* dev, const SDL_GPUTexture* t) {
     const Uint64 k = object_key(t);
@@ -755,6 +796,10 @@ void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GL
     GT3R_PROF("gl.replay");
     (void)arena;
     ReplayState s;
+#if defined(__vita__)
+    std::vector<SDL_GPUDevice::VitaBlock>* blocks = nullptr;
+    GLuint blocks_program = ~0u;
+#endif
     glBindVertexArray(dev->vao);
     for (const DrawRec& d : draws) {
         const SDL_GPUGraphicsPipeline* p = d.pipe;
@@ -818,11 +863,16 @@ void replay(SDL_GPUDevice* dev, const std::vector<DrawRec>& draws, GLsizei w, GL
         // The blocks as uniform arrays (render/shaders/vita_cg.h), every draw: GL keeps uniforms
         // per program, and vitaGL sends them with the draw.
         static const auto uniform4fv = vita_gl<PFNGLUNIFORM4FVPROC>("glUniform4fv");
-        if (const auto it = dev->vita_block_locs.find(p->program); it != dev->vita_block_locs.end() && arena) {
+        if (p->program != blocks_program) { // (the program's block locations: looked up when it changes, not every draw)
+            blocks_program = p->program;
+            const auto it = dev->vita_block_locs.find(p->program);
+            blocks = it != dev->vita_block_locs.end() ? &it->second : nullptr;
+        }
+        if (blocks && arena) {
             for (int st = 0; st < 2; ++st) {
                 const Uint32 n = st == 0 ? p->vs_ubos : p->fs_ubos;
                 for (Uint32 k = 0; k < n && k < kSlots; ++k) {
-                    auto& b = it->second[size_t(st) * kSlots + k];
+                    auto& b = (*blocks)[size_t(st) * kSlots + k];
                     const GLsizei count = std::min(GLsizei(d.ubo_size[st][k] / 16), b.count);
                     if (b.loc < 0 || count <= 0) continue;
                     const Uint8* data = arena + d.ubo_offset[st][k];
@@ -911,13 +961,32 @@ void run_pass(SDL_GPURenderPass* pass) {
     if (!sized) return;
     const GLsizei w = GLsizei(std::max<Uint32>(1, sized->info.width >> mip));
     const GLsizei h = GLsizei(std::max<Uint32>(1, sized->info.height >> mip));
+#if defined(__vita__)
+    // A multisampled colour target draws into its resolve texture (vita_msaa_fbo).
+    SDL_GPUTexture* const vita_resolve = ct && ct->vita_samples > 1 ? pass->color.resolve_texture : nullptr;
+    if (ct && ct->vita_samples > 1 && !vita_resolve) {
+        static bool warned = false;
+        if (!std::exchange(warned, true)) LOG_WARN("OpenGL ES: a multisampled pass with no resolve texture is not drawn on the Vita");
+        glBindFramebuffer(GL_FRAMEBUFFER, GLuint(saved_fb));
+        return;
+    }
+    const GLuint fbo = vita_resolve ? vita_msaa_fbo(dev, vita_resolve, ct->vita_samples, dt) : pass_fbo(dev, ct, layer, mip, dt);
+#else
     const GLuint fbo = pass_fbo(dev, ct, layer, mip, dt);
+#endif
     glViewport(0, 0, w, h);
     glDisable(GL_SCISSOR_TEST);
 
     // (vitaGL starts the GPU scene at the first clear or draw: a wait there is the GPU behind.)
     {
     GT3R_PROF("gl.pass.begin");
+#if defined(__vita__)
+    const Uint64 wait_start = SDL_GetTicksNS();
+    struct WaitNote {
+        Uint64 start;
+        ~WaitNote() { g_gpu_wait_ns += SDL_GetTicksNS() - start; }
+    } wait_note{wait_start};
+#endif
     if (ct && pass->color.load_op == SDL_GPU_LOADOP_CLEAR) {
         const SDL_FColor& c = pass->color.clear_color;
         const GLfloat v[4] = {c.r, c.g, c.b, c.a};
@@ -942,7 +1011,12 @@ void run_pass(SDL_GPURenderPass* pass) {
 
     // Multisample resolve into the resolve texture (a cube face, for cube resolves).
     const SDL_GPUStoreOp store = pass->color.store_op;
-    if (ct && pass->color.resolve_texture &&
+#if defined(__vita__)
+    const bool blit_resolve = !vita_resolve; // (the Vita's multisampled passes drew into it already)
+#else
+    const bool blit_resolve = true;
+#endif
+    if (blit_resolve && ct && pass->color.resolve_texture &&
         (store == SDL_GPU_STOREOP_RESOLVE || store == SDL_GPU_STOREOP_RESOLVE_AND_STORE)) {
         SDL_GPUTexture* rt = pass->color.resolve_texture;
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dev->scratch_draw);
@@ -991,6 +1065,8 @@ SDL_GPUDevice* create_device(bool debug, bool angle) {
 bool active() { return g_device != nullptr; }
 
 bool angle() { return g_device && g_device->angle; }
+
+double take_gpu_wait_ms() { return double(std::exchange(g_gpu_wait_ns, 0)) / 1e6; }
 
 const char* description() { return g_device ? g_device->description.c_str() : ""; }
 
@@ -1167,6 +1243,10 @@ bool gt3r_gl_GPUTextureSupportsSampleCount(SDL_GPUDevice* device, SDL_GPUTexture
     TexFormat f;
     if (!device || !device->renderer || !tex_format(format, &f)) return false;
     if (count == SDL_GPU_SAMPLECOUNT_1) return true;
+#if defined(__vita__)
+    // GXM's 2x and 4x (vita_msaa_fbo); vitaGL reports none through glGetInternalformativ.
+    return count == SDL_GPU_SAMPLECOUNT_2 || count == SDL_GPU_SAMPLECOUNT_4;
+#endif
     const auto key = std::make_pair(f.internal, int(count));
     if (auto it = device->sample_support.find(key); it != device->sample_support.end()) return it->second;
     begin_gl(device);
@@ -1342,6 +1422,12 @@ SDL_GPUGraphicsPipeline* gt3r_gl_CreateGPUGraphicsPipeline(SDL_GPUDevice* device
     p->cull_face = rs.cull_mode == SDL_GPU_CULLMODE_FRONT ? GL_FRONT : GL_BACK;
     // The shaders flip y (see gpu_gles.h), which reverses the winding GL sees.
     p->front_face = rs.front_face == SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE ? GL_CW : GL_CCW;
+#if defined(__vita__)
+    // vitaGL culls back faces only: with GL_FRONT its change_cull_mode draws nothing at all (the rear-view mirror,
+    // whose mirrored view culls the front faces, was black). Culling the front faces is culling the back faces with
+    // the other winding in front; vitaGL uses the winding for nothing else (the shaders' FACE is GXM's own).
+    if (p->cull && p->cull_face == GL_FRONT) p->cull_face = GL_BACK, p->front_face = p->front_face == GL_CW ? GL_CCW : GL_CW;
+#endif
     p->offset = rs.enable_depth_bias;
     p->offset_factor = rs.depth_bias_slope_factor, p->offset_units = rs.depth_bias_constant_factor;
     const SDL_GPUDepthStencilState& ds = info->depth_stencil_state;
@@ -1439,6 +1525,12 @@ SDL_GPUTexture* gt3r_gl_CreateGPUTexture(SDL_GPUDevice* device, const SDL_GPUTex
     t->fmt = f;
     const bool msaa = info->sample_count != SDL_GPU_SAMPLECOUNT_1;
     const bool sampled = info->usage & SDL_GPU_TEXTUREUSAGE_SAMPLER;
+#if defined(__vita__)
+    if (msaa && !f.depth) { // (no storage: vita_msaa_fbo; a multisampled depth target is vitaGL's own)
+        t->vita_samples = sample_count(info->sample_count);
+        return t;
+    }
+#endif
     if (msaa || (f.depth && !sampled)) {
         glGenRenderbuffers(1, &t->rb);
         glBindRenderbuffer(GL_RENDERBUFFER, t->rb);

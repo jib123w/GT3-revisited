@@ -82,6 +82,17 @@ public:
         };
         std::vector<Sphere> primitive_spheres; // parallel to `primitives`
     };
+    // update_geometry in two halves: the meshes assembled into the buffers' contents (any thread: no GPU, and of the
+    // model only its texture count, passed in), then those uploaded (the GPU's thread). The Vita's animated course
+    // nodes are assembled on their worker (race::CourseScene::moving_worker): 2-3 ms a frame off the main thread.
+    struct Assembled {
+        std::vector<scene::Vertex> vertices;
+        std::vector<u32> indices;
+        std::vector<MeshInfo> meshes;
+    };
+    static Assembled assemble_geometry(const std::vector<scene::Mesh>& meshes, size_t texture_count);
+    bool update_geometry(Assembled&& geometry);
+    size_t texture_count() const { return textures().size(); }
     struct TextureInfo {
         SDL_GPUTexture* texture = nullptr;
         bool clamp_u = false, clamp_v = false;

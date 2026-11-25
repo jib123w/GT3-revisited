@@ -764,7 +764,14 @@ inline bool later_step(const Car& c) { return !gt3_program(c.behaviour.rule(Rule
 // The part of the step that is not ported, run in its place: `emit` for the tyre effect emitter 0x1A46C8 that 0x1DF150
 // hands car i's requests to (it draws the VU0 random register).
 using EmitHook = std::function<void(int i, const ChassisOutputs& out, Vu0Random& rng)>;
+// Where the step's phases whose cars are independent run (each car's work touches its own Car and reads shared data
+// only, so the results are the same whatever runs where, and in whatever order): fn(ctx, i) for every i in [0, n), each
+// once, back when all have run. Unset: in turn on the calling thread. The PlayStation Vita shares them with a worker on
+// its third core (base/worker_pool.h); the pool runs them with the caller's floating-point state (the fast physics').
+using CarPool = void (*)(size_t n, void (*fn)(void* ctx, size_t i), void* ctx);
+void set_car_pool(CarPool pool);
 // Phases 1-9 for every car, each phase for all cars before the next; `plan` is the AI's line evaluation and speed planning.
+// Phases 4-9 (steering to the feedback) run car by car through the pool: each touches its own car only.
 void tick_until_collision(std::span<Car> cars, std::span<const CarInputs> in, const RaceInputs& race, AiPlan& plan);
 // Phases 11 (`k`: the conductor's proximity matrices; null skips the phase, as the step's second entry mode does), 12 and 13.
 void tick_after_collision(std::span<Car> cars, std::span<const CarInputs> in, const RaceInputs& race, Proximity* k,

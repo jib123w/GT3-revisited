@@ -26,8 +26,9 @@ public:
     static constexpr float kMin = 0.5f, kStep = 0.05f;
 
     // Starts over at `start_scale` (default: `max_scale`), between 50% and `max_scale`, the most it
-    // goes up to (above 1 with supersampling); `refresh_hz` = the display's (0: unknown).
-    void reset(float max_scale, float refresh_hz, float start_scale = 0);
+    // goes up to (above 1 with supersampling); `refresh_hz` = the display's (0: unknown). `target_fps`:
+    // the frame rate limit when one is set (the Vita's 30 fps: 33 ms frames are on time, not late), else 60.
+    void reset(float max_scale, float refresh_hz, float start_scale = 0, int target_fps = 0);
     // One frame: its wall time and the part spent presenting (waiting for the GPU or the
     // display). Returns the scale to render at.
     float frame(double frame_ms, double present_ms);

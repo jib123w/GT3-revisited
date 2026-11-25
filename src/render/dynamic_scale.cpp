@@ -8,13 +8,15 @@
 
 namespace gt3r::render {
 
-void DynamicScale::reset(float max_scale, float refresh_hz, float start_scale) {
+void DynamicScale::reset(float max_scale, float refresh_hz, float start_scale, int target_fps) {
     *this = DynamicScale{};
     max_ = std::clamp(max_scale, kMin, platform::kMaxRenderScale);
     scale_ = start_scale > 0 ? std::clamp(start_scale, kMin, max_) : max_;
+    const double want_ms = 1000.0 / (target_fps > 0 && target_fps < 60 ? target_fps : 60);
+    target_ms_ = want_ms;
     if (refresh_hz > 1) {
         refresh_ms_ = 1000.0 / refresh_hz;
-        target_ms_ = std::ceil(1000.0 / 60.0 / refresh_ms_ - 0.05) * refresh_ms_;
+        target_ms_ = std::ceil(want_ms / refresh_ms_ - 0.05) * refresh_ms_;
     }
 }
 

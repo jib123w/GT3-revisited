@@ -92,6 +92,25 @@ void RaceScreen::draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const ren
     const SDL_FRect mr = mirror_rect(frame, half, custom);
     std::unique_ptr<render::View3D>& mv = p2 ? mirror_view2_ : mirror_view_;
     if (!mv) mv = std::make_unique<render::View3D>(*app.gpu());
+#if defined(SDL_PLATFORM_VITA)
+    // The Vita draws the mirror (a second view of the course: its items and passes) every third frame
+    // and shows its last picture in between; a mirror not shown the frame before is drawn afresh.
+    {
+        MirrorPace& pace = mirror_pace_[p2 ? 1 : 0];
+        const bool continuing = pace.serial + 1 == frame_serial_;
+        pace.serial = frame_serial_;
+        pace.phase = continuing ? (pace.phase + 1) % 3 : 0;
+        if (pace.phase != 0) {
+            SDL_SetRenderDrawColor(ui.renderer(), 0, 0, 0, 255);
+            SDL_RenderFillRect(ui.renderer(), &mr);
+            if (mv->show_last(ui.renderer(), mr)) {
+                SDL_RenderRect(ui.renderer(), &mr);
+                return;
+            }
+            pace.phase = 0; // (no picture yet: drawn now)
+        }
+    }
+#endif
     // From the in-car view (a custom camera's too: CameraRig::mirror_view), looking back.
     const render::Mat4 cam_view = cam.mirror_view();
     render::Vec3 eye = cam.mirror_eye();
@@ -101,13 +120,30 @@ void RaceScreen::draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const ren
     TyreSmoke::View sv = smoke_view(cam, mr.w / mr.h, 2.0f * std::atan(t));
     sv.forward = {cam_view.at(2, 0), cam_view.at(2, 1), cam_view.at(2, 2)}; // the mirror looks back
     sv.far_m = 120;
+#if defined(SDL_PLATFORM_VITA)
+    // The Vita: the cars behind take their simpler models eight times nearer than in the main view (the mirror is
+    // ~64 lines tall and its draws were as costly as half the main view's: they follow the draw calls).
+    const float lod_scale = race::car_lod_scale();
+    race::set_car_lod_scale(lod_scale / 8.0f);
+#endif
     // (Not the own car: it would fill the view.)
     collect_items(eye, {cam_view.at(0, 0), cam_view.at(0, 1), cam_view.at(0, 2)}, p2, !p2, sv,
                   half ? ItemsView::SplitMirror : ItemsView::Mirror, p2 ? 1 : 0);
+#if defined(SDL_PLATFORM_VITA)
+    race::set_car_lod_scale(lod_scale);
+#endif
     render::DrawOptions o = main;
     o.mirrored = true;
     o.draw_distance = 120;
     o.far_clip = 0; // (its projection's own far plane: GT3's 120 m)
+#if defined(SDL_PLATFORM_VITA)
+    // ... the scenery's small objects go at the size they have in the mirror (DrawOptions::min_size: the main
+    // view's threshold left most of its draws a pixel or two across there), it reaches 80 m, not GT3's 120 (its
+    // fog hides most of the rest at that size), and it has no grading pass of its own.
+    o.min_size = std::max(o.min_size * 7.0f, 0.02f);
+    o.draw_distance = 80;
+    o.post_grade.on = false;
+#endif
     // The mirror's own fog (Env0 +0xA90 RGB, +0xAA0 distance A, +0xAA4 minimum visibility b;
     // A = 0: a constant visibility b), per vertex like the main view's, b = 1 included.
     const SunParams& env = sun_.params();
@@ -127,6 +163,7 @@ void RaceScreen::draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const ren
     SDL_SetRenderDrawColor(ui.renderer(), 0, 0, 0, 255);
     SDL_RenderFillRect(ui.renderer(), &mr);
     mv->draw(ui.renderer(), mr, view, proj, eye, items_, o);
+    hitch::mirror_draws = mv->stats().draw_calls;
     SDL_SetRenderDrawColor(ui.renderer(), 0, 0, 0, 255);
     SDL_RenderRect(ui.renderer(), &mr);
 }
@@ -676,7 +713,18 @@ render::DrawOptions RaceScreen::draw_options() const {
     // ... and the scenery's small far objects go too (DrawOptions::min_size): under ~3 pixels across
     // at the 3D resolutions those settings go with (Performance 75%, Max performance 50%). On Trial
     // Mountain the frame rate followed the draw calls: 500 a frame 28 fps, 1,200 16 fps.
-    if (draw_share_ < 1.0f) o.min_size = draw_share_ <= 0.5f ? 0.005f : 0.003f;
+    // Below that 3D resolution (the dynamic resolution's lower steps) the threshold keeps the same size in pixels:
+    // when the GPU falls behind, the far objects too small to see go as well.
+    if (draw_share_ < 1.0f) {
+#if defined(SDL_PLATFORM_VITA)
+        const float performance = 0.004f; // (a frame there was 1,600-2,900 draw calls on Performance: ~15 us each)
+#else
+        const float performance = 0.003f;
+#endif
+        const float base = draw_share_ <= 0.5f ? 0.005f : performance, at = draw_share_ <= 0.5f ? 0.5f : 0.75f;
+        const float scale = app_ && app_->gpu() ? app_->gpu()->render_scale() : at;
+        o.min_size = base * std::max(1.0f, at / std::max(scale, 0.25f));
+    }
     o.fog = true;
     o.fog_start = 350;
     o.fog_end = 3000;
@@ -908,10 +956,15 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
 #if !defined(__vita__) // (the Vita: no CPU clipping at GT3's guard band, View3D::upload_clipped; the GPU clips)
     ov.guard_near = camera_.gt3_near();
 #endif
+    // The frame's race steps on the third core while the view is drawn (async_ticks_): everything the frame shows of
+    // the race is collected above; the mirror, the second view and the HUD below read the race after the join.
+    start_async_ticks(app);
     view_->draw(ui.renderer(), rect, camera_.view(), camera_.projection(rect.w / rect.h), eye, items_, ov);
+    join_async_ticks();
     remove_wet_road(wet_items); // (the wet road's frame items belong to this view only)
     hitch::draw_ms = double(SDL_GetTicksNS() - h_c1) / 1e6;
     hitch::meshes = view_->stats().meshes_drawn;
+    hitch::draws = view_->stats().draw_calls;
     if (!replaying_ && !demo_replay() && !race_preview_ && mirror_on_ && camera_.shows_mirror() && (!split || horizontal)) // (no mirror in a replay's or demonstration's driver's view)
         draw_mirror(app, ui, rect, o, false, split);
     if (split) {

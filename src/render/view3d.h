@@ -386,6 +386,10 @@ public:
              options);
     }
 
+    // The picture the last draw() composited, composited again at `rect` with nothing drawn (the Vita's
+    // rear-view mirror between the frames it is drawn: RaceScreen::draw_mirror). False when there is none.
+    bool show_last(SDL_Renderer* renderer, const SDL_FRect& rect);
+
     // Renders straight into `target` (`w` x `h`, the context's colour format: a VR eye's canvas),
     // the multisampled picture resolved into it; no composite pass. False on failure.
     bool draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, const Mat4& proj, const Vec3& eye,
@@ -530,6 +534,8 @@ private:
     SDL_GPUTexture* msaa_ = nullptr;    // multisampled colour (when MSAA is on)
     SDL_GPUTexture* depth_ = nullptr;
     SDL_Texture* wrapper_ = nullptr;    // color_ as an SDL_Renderer texture
+    SDL_Texture* shown_ = nullptr;      // the texture draw() last composited, and its used corner (show_last)
+    SDL_FRect shown_src_{0, 0, 0, 0};
     // Supersampling past 2x: the picture halved (half_, as half_wrapper_ for the 2D renderer).
     SDL_GPUTexture* half_ = nullptr;
     SDL_Texture* half_wrapper_ = nullptr;

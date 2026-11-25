@@ -103,6 +103,30 @@ void RaceScreen::look_around([[maybe_unused]] App& app, CameraRig& cam, const Pa
     cam.set_look(on ? pad.axis_fine(PadAxis::RX) : 0.0f, on ? pad.axis_fine(PadAxis::RY) : 0.0f);
 }
 
+void RaceScreen::run_pending_ticks(App& app) {
+    join_async_ticks();
+    const int n = std::exchange(async_ticks_, 0);
+    for (int i = 0; i < n; ++i) tick(app, async_pad_);
+}
+
+void RaceScreen::start_async_ticks(App& app) {
+    if (async_ticks_ <= 0) return;
+    if (!step_job_) step_job_ = std::make_unique<AsyncJob>(2); // (the third core; the per-car helper is on the second)
+    const int n = std::exchange(async_ticks_, 0);
+    App* a = &app;
+    step_job_->start([this, a, n] {
+        const Uint64 t0 = SDL_GetTicksNS();
+        for (int i = 0; i < n; ++i) tick(*a, async_pad_);
+        async_ms_ = double(SDL_GetTicksNS() - t0) / 1e6;
+    });
+}
+
+void RaceScreen::join_async_ticks() {
+    if (!step_job_ || !step_job_->running()) return;
+    step_job_->join();
+    hitch::ticks_ms = async_ms_; // (the steps' own time, overlapped with the draw)
+}
+
 void RaceScreen::tick(App& app, const PadState& pad) {
     GT3R_PROF("race.tick");
     double dt = step_.step();
@@ -511,6 +535,7 @@ int RaceScreen::pod_prompt(int player) const {
 
 void RaceScreen::update_drive(App& app, double dt) {
     GT3R_PROF("race.update_drive");
+    if (async_ticks_ > 0) run_pending_ticks(app); // (the frame before drew no main view: its steps first, in order)
     // A pod race's three notes (RacePODDisplay, 0x1AF650: with the race live, 3 s each, the first 2 s in, so they run
     // through the start's countdown; one player's race only, the 2 player display has none).
     if (!pod_intro_posted_ && !two_player_ && !replaying_ && !backdrop_ && !quick_ && !attract_ && pod_race()) {
@@ -707,7 +732,11 @@ void RaceScreen::update_drive(App& app, double dt) {
     int n = step_.advance(dt);
     if (online_) n = online_ticks(n);
     Uint64 h_t0 = SDL_GetTicksNS();
-    for (int i = 0; i < n; ++i) tick(app, pad);
+    if (async_ticks_allowed() && n > 0) {
+        async_ticks_ = n, async_pad_ = pad; // (run while the main view is drawn: start_async_ticks)
+    } else {
+        for (int i = 0; i < n; ++i) tick(app, pad);
+    }
     hitch::ticks = n, hitch::ticks_ms = double(SDL_GetTicksNS() - h_t0) / 1e6;
     hitch::smoke = int(smoke_.live()), hitch::x = render_state_.position.x, hitch::z = render_state_.position.z;
     hitch::race_t = float(race_time_);

@@ -28,6 +28,9 @@
 #include "base/bytes.h"
 #include "formats/ps_adpcm.h"
 
+#include <SDL3/SDL_mutex.h>
+#include <SDL3/SDL_thread.h>
+
 #include <array>
 #include <atomic>
 #include <functional>
@@ -77,6 +80,9 @@ public:
     enum class Interpolation : u8 { Gaussian, Cubic };
 
     VoiceMixer();
+    ~VoiceMixer();
+    VoiceMixer(const VoiceMixer&) = delete;
+    VoiceMixer& operator=(const VoiceMixer&) = delete;
 
     VoiceId key_on(const VoiceParams& p);
     void key_off(VoiceId v); // enters the release phase
@@ -175,6 +181,27 @@ private:
     void apply(const Change& c);
     void render_block(s16* out, size_t frames);
     void render(s16* out, size_t frames, const BlockParams& p);
+    // One pass of the block's voices (render): each bus's dry and wet sums for its output sample (two at half rate).
+    struct PassSums {
+        s32 l[2], r[2], wl[2], wr[2];
+    };
+    // The block's voices [first, last) into `sums`, one entry a pass, added to. Each voice's work is its own (its state,
+    // its sample data) and the sums are whole numbers, so the voices can be split between threads and the output is
+    // the same to the bit (the Vita's helper takes a share).
+    void render_voices(size_t first, size_t last, size_t frames, bool gauss, std::vector<PassSums>& sums);
+    std::vector<PassSums> sums_, helper_sums_;
+#if defined(__vita__)
+    // The Vita: about half the voices mixed by a helper on the third core while the mixing thread does the rest (the
+    // race's ~46 voices took ~90% of the audio thread's core, and its busiest moments ran the output dry: crackling).
+    static int SDLCALL helper_main(void* self);
+    void helper_loop();
+    SDL_Thread* helper_ = nullptr;
+    SDL_Semaphore* helper_go_ = nullptr;
+    SDL_Semaphore* helper_done_ = nullptr;
+    std::atomic<bool> helper_quit_{false};
+    size_t job_first_ = 0, job_last_ = 0, job_frames_ = 0; // (set before helper_go_ is posted)
+    bool job_gauss_ = true;
+#endif
     static s32 next_sample(Voice& v);
     static void step_envelope(Voice& v);
     static bool env_tick(Voice& v, int rate, int rate_mask, bool exponential, bool decrease);

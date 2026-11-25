@@ -176,6 +176,9 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
     fs_resample_ = make_shader(Stage::ResampleFragment);
     fs_fx_ = make_shader(Stage::FxFragment);
     fs_no_color_ = make_shader(Stage::NoColorFragment);
+#if GT3R_VITA
+    fs_opaque_ = make_shader(Stage::OpaqueFragment); // (PipelineKey::opaque; elsewhere the plain variant draws them)
+#endif
     if (!vs_ || !vs_clipped_ || !fs_ || !fs_plain_ || !fs_filter_ || !fs_resample_ || !fs_fx_ || !fs_no_color_)
         return false;
     vs_copy_ = make_shader(Stage::CopyVertex);
@@ -225,6 +228,7 @@ GpuContext::~GpuContext() {
         if (fs_resample_) SDL_ReleaseGPUShader(device_, fs_resample_);
         if (fs_fx_) SDL_ReleaseGPUShader(device_, fs_fx_);
         if (fs_no_color_) SDL_ReleaseGPUShader(device_, fs_no_color_);
+        if (fs_opaque_) SDL_ReleaseGPUShader(device_, fs_opaque_);
     }
     if (renderer_) SDL_DestroyRenderer(renderer_); // releases the window claim
     if (device_) SDL_DestroyGPUDevice(device_);
@@ -236,7 +240,8 @@ SDL_GPUShader* GpuContext::make_shader(Stage stage) {
                                        GT3R_SHADER_CODE(model_frag),       GT3R_SHADER_CODE(model_frag_plain),
                                        GT3R_SHADER_CODE(model_frag_filter), GT3R_SHADER_CODE(model_frag_resample),
                                        GT3R_SHADER_CODE(model_frag_fx),    GT3R_SHADER_CODE(model_vert_copy),
-                                       GT3R_SHADER_CODE(model_frag_copy),  GT3R_SHADER_CODE(no_color_frag)};
+                                       GT3R_SHADER_CODE(model_frag_copy),  GT3R_SHADER_CODE(no_color_frag),
+                                       GT3R_SHADER_CODE(model_frag_plain)}; // (OpaqueFragment: the Vita has its own)
     const ShaderCode* code = &kCode[size_t(stage)];
 #if GT3R_VITA
     // The Vita: the Cg shaders (render/shaders/vita_cg.h, docs/dev/VITA.md). The stages it has no
@@ -246,6 +251,7 @@ SDL_GPUShader* GpuContext::make_shader(Stage stage) {
     static const std::string clip_vert = std::string("#define CLIPPED 1\n") + v::model_vert;
     static const std::string plain_frag = std::string("#define PLAIN 1\n") + v::model_frag;
     static const std::string resample_frag = std::string("#define RESAMPLE 1\n") + v::model_frag;
+    static const std::string opaque_frag = std::string("#define PLAIN 1\n#define NO_DISCARD 1\n") + v::model_frag;
     const auto vita = [](const char* src, const char* blocks, const char* samplers, const char* attributes) {
         return ShaderCode{nullptr, 0, nullptr, src, blocks, samplers, attributes};
     };
@@ -260,6 +266,7 @@ SDL_GPUShader* GpuContext::make_shader(Stage stage) {
         vita(v::model_vert, v::vertex_blocks, "", v::vertex_attributes),                // CopyVertex
         vita(v::model_frag, v::fragment_blocks, v::fragment_samplers, nullptr),         // CopyFragment
         vita(v::no_color_frag, "", "", nullptr),                                         // NoColorFragment
+        vita(opaque_frag.c_str(), v::fragment_blocks, v::fragment_samplers, nullptr),   // OpaqueFragment
     };
     static_assert(sizeof(kVita) / sizeof(kVita[0]) == sizeof(kCode) / sizeof(kCode[0]));
     code = &kVita[size_t(stage)];
@@ -714,7 +721,7 @@ SDL_GPUGraphicsPipeline* GpuContext::create_pipeline(const PipelineKey& key) {
                            : key.resample  ? fs_resample_
                            : key.fx        ? fs_fx_
                            : key.gs_filter ? fs_filter_
-                           : key.plain     ? fs_plain_
+                           : key.plain     ? (key.opaque && fs_opaque_ ? fs_opaque_ : fs_plain_)
                                            : fs_;
     info.vertex_input_state.vertex_buffer_descriptions = &vb;
     info.vertex_input_state.num_vertex_buffers = 1;

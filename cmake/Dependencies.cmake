@@ -126,7 +126,8 @@ endif()
 # compiler's go to gt3r.log (patches/vitagl-log.patch: vgl_log -> gt3r_vgl_log in
 # src/app/vita_process.cpp). HAVE_GC_ON_FINISH: glFinish also frees what its garbage collector holds back
 # for 4 frames (a load, with no frames between, ran out of memory with the menus' freed models still
-# held). The game links it ahead of VitaSDK's (CMakeLists.txt).
+# held). HAVE_ACCURATE_MSAA: multisampled frame buffers (glFramebufferTexture2DMultisample), the
+# anti-aliasing (src/render/gpu_gles.cpp vita_msaa_fbo). The game links it ahead of VitaSDK's (CMakeLists.txt).
 if(GT3R_VITA)
   include(ExternalProject)
   find_package(Git REQUIRED)
@@ -144,7 +145,7 @@ if(GT3R_VITA)
     UPDATE_DISCONNECTED TRUE
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE TRUE
-    BUILD_COMMAND $(MAKE) HAVE_GLSL_UBOS=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 HAVE_GC_ON_FINISH=1
+    BUILD_COMMAND $(MAKE) HAVE_GLSL_UBOS=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 HAVE_GC_ON_FINISH=1 HAVE_ACCURATE_MSAA=1
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS <SOURCE_DIR>/libvitaGL.a)
   ExternalProject_Get_Property(vitagl SOURCE_DIR)

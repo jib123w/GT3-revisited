@@ -583,10 +583,10 @@ private:
         default: break;
         }
 #if defined(__vita__)
-        // Rows that do nothing on the Vita, on every page: always fullscreen, one sample, vitaGL's
-        // renderer only, no anisotropic filtering, no window to lose focus, no Xbox pads or keyboard
-        // to speak of, one audio output, no music folder to open or allow.
-        static const char* const kVitaHidden[] = {"Fullscreen",          "Anti-aliasing (MSAA)", "Anisotropic filtering",
+        // Rows that do nothing on the Vita, on every page: always fullscreen, vitaGL's renderer only,
+        // no anisotropic filtering, no window to lose focus, no Xbox pads or keyboard to speak of, one
+        // audio output, no music folder to open or allow.
+        static const char* const kVitaHidden[] = {"Fullscreen",          "Anisotropic filtering",
                                                   "3D renderer",         "Controllers in the background",
                                                   "Xbox controllers",    "Keyboard",             "Output device",
                                                   "Audio device",        "Open music folder",    "Allow music access"};
@@ -605,9 +605,10 @@ private:
     // heading. Rows not listed stay, after the rest.
     void arrange_vita_display() {
         static const char* const kOrder[] = {
-            "#Performance",   "Performance profile", "Frame rate limit",       "Physics",
+            "#Performance",   "Performance profile", "Frame rate limit",       "Physics", "Physics on its own core",
             "FPS counter",    "#Picture",            "3D resolution",          "Dynamic resolution",
             "VSync",          "Aspect ratio",        "Gamma",                  "Reset gamma to 1.00",
+            "#Anti-aliasing", "Anti-aliasing (MSAA)",
             "#Details",       "Draw distance",       "Scenery animation",      "Car reflections",
             "Car shadows",    "Rear-view mirror",    "Colour grading",         "Car detail",
             "Always show full car detail",
@@ -735,6 +736,15 @@ private:
                    a->config().set("race", "physics", i == 1 ? "fast" : "exact");
                    a->save_config();
                });
+        // [race] physics_thread (RaceScreen::start_async_ticks)
+        toggle("Physics on its own core",
+               "On: the race's physics runs on another of the Vita's cores while the picture is drawn, for more frames; "
+               "the picture shows the race one frame later. Off: the physics and the picture take turns on one core "
+               "(the quickest response to the controls).",
+               to_lower(cfg.get("race", "physics_thread").value_or("on")) != "off", [a](bool v) {
+                   a->config().set("race", "physics_thread", v ? "on" : "off");
+                   a->save_config();
+               });
 #endif
         toggle("FPS counter", "Show the frames drawn per second in a corner of the screen.", app.show_fps(),
                [a](bool v) { a->set_show_fps(v); });
@@ -765,7 +775,14 @@ private:
             names.push_back(levels[i] > 1 ? std::to_string(levels[i]) + "x" : "Off");
             if (in_use >= levels[i]) idx = int(i);
         }
-        Row& msaa = choice("Anti-aliasing (MSAA)", "Smooths jagged edges of 3D models. Higher costs more GPU time.", names, idx,
+#if defined(__vita__)
+        const char* msaa_desc = "Smooths the jagged edges of the cars and the course (the Vita GPU's own 2x or 4x). Costs GPU "
+                                "time and memory: with dynamic resolution on, the picture gets a little smaller to keep "
+                                "the frame rate. Off for the most frames.";
+#else
+        const char* msaa_desc = "Smooths jagged edges of 3D models. Higher costs more GPU time.";
+#endif
+        Row& msaa = choice("Anti-aliasing (MSAA)", msaa_desc, names, idx,
                            [a, levels](int i) {
                                a->config().set("video", "msaa", std::to_string(levels[i]));
                                if (a->gpu()) a->gpu()->set_msaa(levels[i]);
@@ -1573,10 +1590,18 @@ private:
                 std::vector<std::string> rnames = {"Modern", "GT3 original"};
                 if (kept) rnames.push_back("Custom");
                 const int ridx = in_use ? 2 : in.race_layout(p) == "gt3" ? 1 : 0;
+#if defined(__vita__)
+                const char* layouts_desc =
+                    "GT3 original: Cross accelerates, Square brakes, R / L shift up / down (the Vita has no L2 / R2), "
+                    "Select changes the view, the right stick looks around and back. Modern: triggers gas/brake (a "
+                    "controller with triggers, on a PS TV), Cross/Square shift, Triangle view.";
+#else
+                const char* layouts_desc = "Modern: triggers gas/brake, Cross/Square shift, Triangle view. GT3 original: "
+                                           "the race reads the menu buttons. Back paddles shift in both.";
+#endif
                 std::string desc = in_use ? "Custom race controls are in use (below). Modern or GT3 original keeps them "
                                             "for later."
-                                          : "Modern: triggers gas/brake, Cross/Square shift, Triangle view. GT3 original: "
-                                            "the race reads the menu buttons. Back paddles shift in both.";
+                                          : layouts_desc;
                 if (kept && !in_use) desc += " Your custom set is kept: choose Custom to use it.";
                 choice("Race controls", desc, rnames, ridx, [a, p](int i) {
                     if (i == 2) a->input().use_custom(p, true);

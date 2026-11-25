@@ -13,7 +13,7 @@
 extracted/
 dump/
 # Your own Vita LiveArea pictures and their sources (packaging/vita/make_custom_art.ps1)
-packaging/vita/custom/
+packaging/vita/custom*/
 
 build*/
 .DS_Store

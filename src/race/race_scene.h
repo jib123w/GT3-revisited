@@ -112,7 +112,10 @@ private:
         std::mutex mutex;
         std::condition_variable cv;
         bool pending = false, busy = false, done = false, quit = false;
-        std::vector<scene::Mesh> result[2]; // scenery_moving_'s, backdrop_moving_'s
+        // scenery_moving_'s, backdrop_moving_'s: assembled for their models there (GpuModel::assemble_geometry, with
+        // the texture counts given with the job), uploaded on the main thread.
+        render::GpuModel::Assembled result[2];
+        size_t texture_count[2] = {0, 0};
     };
     std::unique_ptr<MovingJob> job_;
     float moving_pending_ = 0;
@@ -335,6 +338,7 @@ render::Mat4 car_matrix(const sim::VehicleState& s);
 // draws on the PlayStation Vita).
 int car_lod(float dist, int lods, bool full_detail = false);
 void set_car_lod_scale(float scale);
+float car_lod_scale();
 
 // The car callback's values for a state (gtm1::RunParams::callback; RacePS2Base's frame, 0x1A9B00 on Tokyo-Geneva
 // Europe): ids 1-4 the flaps, 0.5 + 0.5 x (physics §8.8); id 5 the steering, 0.5 + 0.5 steer / lock (0.5 straight

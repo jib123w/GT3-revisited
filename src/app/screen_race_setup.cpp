@@ -18,12 +18,23 @@ namespace gt3r::race_screen {
 // the Vita, [race] physics = exact |
 // fast (ee::HostMathScope, base/ee_float.h).
 void RaceScreen::read_live_settings(App& app) {
+#if defined(__vita__)
+    // [race] physics_thread = on (default) | off: the race steps on the third core while the frame is drawn
+    // (async_ticks_; the picture a frame later).
+    async_physics_ = to_lower(app.config().get("race", "physics_thread").value_or("on")) != "off";
+#endif
     draw_share_ = std::clamp(float(std::atoi(app.video_setting("draw_distance").c_str())) / 100.0f, 0.25f, 1.0f);
     reduced_animation_ = app.video_setting("scenery_animation") == "reduced";
     mirror_on_ = app.video_setting("rear_mirror") != "off";
     grading_on_ = app.video_setting("color_grading") != "off";
     // [video] car_detail = normal | low (race::car_lod: the simpler models nearer).
+#if defined(__vita__)
+    // The Vita's normal: the simpler models from half GT3's distances (its picture is 480-720 pixels wide: the full
+    // models of the cars round a starting grid were most of its 2,800 draw calls a frame there).
+    race::set_car_lod_scale(app.video_setting("car_detail") == "low" ? 1.0f / 3.0f : 0.5f);
+#else
     race::set_car_lod_scale(app.video_setting("car_detail") == "low" ? 1.0f / 3.0f : 1.0f);
+#endif
 #if defined(__vita__)
     const bool fast = to_lower(app.config().get("race", "physics").value_or("exact")) == "fast";
     if (fast != host_math_) LOG_INFO("Race: %s physics", fast ? "fast (the Vita's FPU, not bit for bit)" : "exact");
@@ -499,6 +510,7 @@ void RaceScreen::take_best_run_ghost() {
 }
 
 void RaceScreen::restart() {
+    join_async_ticks(), async_ticks_ = 0; // (a new run: the old one's pending steps go)
     take_live_condition(); // the previous live run hands its engine condition on
     replaying_ = false;
     run_recorded_ = false;
@@ -560,6 +572,7 @@ sim::EngineCondition RaceScreen::live_condition() const {
 }
 
 void RaceScreen::drop_vehicle() {
+    join_async_ticks(), async_ticks_ = 0; // (the field goes: no steps on it after)
     take_live_condition();
     if (track_) track_->set_lap_source(nullptr);
     vehicle_ = nullptr;
